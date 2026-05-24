@@ -1,0 +1,66 @@
+name: Build Linux Portable
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-cursor0 libxcb-xinerama0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 \
+            libegl1 libgl1 libglib2.0-0 \
+            upx-ucl
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Read version
+        id: ver
+        run: |
+          VER=$(python -c "import re; m=re.search(r\"APP_VERSION = '(.+?)'\", open('ui/main_window.py').read()); print(m.group(1))")
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "Building version $VER"
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller FlowerGraph.spec --clean --noconfirm
+
+      - name: Create portable ZIP
+        run: |
+          python - <<'EOF'
+          import zipfile, pathlib
+          src = pathlib.Path("dist/FlowerGraph")
+          out = pathlib.Path("FlowerGraph_linux_portable.zip")
+          with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for f in src.rglob("*"):
+                  if f.is_file():
+                      z.write(f, pathlib.Path("FlowerGraph") / f.relative_to(src))
+          print(f"ZIP: {out}  ({out.stat().st_size//1024//1024} MB)")
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlowerGraph-${{ steps.ver.outputs.version }}-linux-portable
+          path: FlowerGraph_linux_portable.zip
+          retention-days: 30
