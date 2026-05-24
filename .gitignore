@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs & temp
+flowergraph.log
+*.log
+
+# User config (создаётся при первом запуске)
+settings.json
+
+# Test recordings (не нужны в репо)
+*.fgd
+
+# OS
+.DS_Store
+Thumbs.db

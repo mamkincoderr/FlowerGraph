@@ -1,0 +1,79 @@
+PS D:\DexWRK\PGN\FlowerGraph> .\setup_venv.bat
+=== FlowerGraph: ╤Б╨╛╨╖╨┤╨░╨╜╨╕╨╡ ╨▓╨╕╤А╤В╤Г╨░╨╗╤М╨╜╨╛╨│╨╛ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╤П ===
+Requirement already satisfied: pip in d:\dexwrk\pgn\flowergraph\.venv\lib\site-packages (25.0.1)
+Collecting pip
+  Downloading pip-26.1.1-py3-none-any.whl.metadata (4.6 kB)
+Downloading pip-26.1.1-py3-none-any.whl (1.8 MB)
+   ---------------------------------------- 1.8/1.8 MB 3.4 MB/s eta 0:00:00
+
+[notice] A new release of pip is available: 25.0.1 -> 26.1.1
+[notice] To update, run: python.exe -m pip install --upgrade pip
+ERROR: To modify pip, please run the following command:
+D:\DexWRK\PGN\FlowerGraph\.venv\Scripts\python.exe -m pip install --upgrade pip
+Collecting PySide6>=6.7.0 (from -r requirements.txt (line 1))
+  Downloading pyside6-6.11.1-cp310-abi3-win_amd64.whl.metadata (5.5 kB)
+Collecting pyqtgraph>=0.13.7 (from -r requirements.txt (line 2))
+  Downloading pyqtgraph-0.14.0-py3-none-any.whl.metadata (1.5 kB)
+Collecting numpy>=1.26.0 (from -r requirements.txt (line 3))
+  Downloading numpy-2.4.5-cp312-cp312-win_amd64.whl.metadata (6.6 kB)
+Collecting scipy>=1.13.0 (from -r requirements.txt (line 4))
+  Downloading scipy-1.17.1-cp312-cp312-win_amd64.whl.metadata (60 kB)
+Collecting pyserial>=3.5 (from -r requirements.txt (line 5))
+  Using cached pyserial-3.5-py2.py3-none-any.whl.metadata (1.6 kB)
+Collecting cobs>=1.2.0 (from -r requirements.txt (line 6))
+  Downloading cobs-1.2.2-cp312-cp312-win_amd64.whl.metadata (12 kB)
+Collecting PyInstaller>=6.6.0 (from -r requirements.txt (line 7))
+  Downloading pyinstaller-6.20.0-py3-none-win_amd64.whl.metadata (8.5 kB)
+Collecting shiboken6==6.11.1 (from PySide6>=6.7.0->-r requirements.txt (line 1))
+  Downloading shiboken6-6.11.1-cp310-abi3-win_amd64.whl.metadata (2.5 kB)
+Collecting PySide6_Essentials==6.11.1 (from PySide6>=6.7.0->-r requirements.txt (line 1))
+  Downloading pyside6_essentials-6.11.1-cp310-abi3-win_amd64.whl.metadata (3.8 kB)
+Collecting PySide6_Addons==6.11.1 (from PySide6>=6.7.0->-r requirements.txt (line 1))
+  Downloading pyside6_addons-6.11.1-cp310-abi3-win_amd64.whl.metadata (4.2 kB)
+Collecting colorama (from pyqtgraph>=0.13.7->-r requirements.txt (line 2))
+  Using cached colorama-0.4.6-py2.py3-none-any.whl.metadata (17 kB)
+Collecting altgraph (from PyInstaller>=6.6.0->-r requirements.txt (line 7))
+  Downloading altgraph-0.17.5-py2.py3-none-any.whl.metadata (7.5 kB)
+Collecting packaging>=22.0 (from PyInstaller>=6.6.0->-r requirements.txt (line 7))
+  Downloading packaging-26.2-py3-none-any.whl.metadata (3.5 kB)
+Collecting pefile>=2022.5.30 (from PyInstaller>=6.6.0->-r requirements.txt (line 7))
+  Downloading pefile-2024.8.26-py3-none-any.whl.metadata (1.4 kB)
+Collecting pyinstaller-hooks-contrib>=2026.4 (from PyInstaller>=6.6.0->-r requirements.txt (line 7))
+  Downloading pyinstaller_hooks_contrib-2026.5-py3-none-any.whl.metadata (16 kB)
+Collecting pywin32-ctypes>=0.2.1 (from PyInstaller>=6.6.0->-r requirements.txt (line 7))
+  Using cached pywin32_ctypes-0.2.3-py3-none-any.whl.metadata (3.9 kB)
+Collecting setuptools>=42.0.0 (from PyInstaller>=6.6.0->-r requirements.txt (line 7))
+  Downloading setuptools-82.0.1-py3-none-any.whl.metadata (6.5 kB)
+Downloading pyside6-6.11.1-cp310-abi3-win_amd64.whl (578 kB)
+   ---------------------------------------- 578.4/578.4 kB 5.1 MB/s eta 0:00:00
+Downloading pyside6_addons-6.11.1-cp310-abi3-win_amd64.whl (168.8 MB)
+   ---------------------------------------- 168.8/168.8 MB 8.0 MB/s eta 0:00:00
+Downloading pyside6_essentials-6.11.1-cp310-abi3-win_amd64.whl (77.5 MB)
+   ---------------------------------------- 77.5/77.5 MB 7.8 MB/s eta 0:00:00
+Downloading shiboken6-6.11.1-cp310-abi3-win_amd64.whl (1.2 MB)
+   ---------------------------------------- 1.2/1.2 MB 10.3 MB/s eta 0:00:00
+Downloading pyqtgraph-0.14.0-py3-none-any.whl (1.9 MB)
+   ---------------------------------------- 1.9/1.9 MB 8.8 MB/s eta 0:00:00
+Downloading numpy-2.4.5-cp312-cp312-win_amd64.whl (12.3 MB)
+   ---------------------------------------- 12.3/12.3 MB 9.5 MB/s eta 0:00:00
+Downloading scipy-1.17.1-cp312-cp312-win_amd64.whl (36.5 MB)
+   ---------------------------------------- 36.5/36.5 MB 6.9 MB/s eta 0:00:00
+Using cached pyserial-3.5-py2.py3-none-any.whl (90 kB)
+Downloading cobs-1.2.2-cp312-cp312-win_amd64.whl (27 kB)
+Downloading pyinstaller-6.20.0-py3-none-win_amd64.whl (1.4 MB)
+   ---------------------------------------- 1.4/1.4 MB 9.0 MB/s eta 0:00:00
+Downloading packaging-26.2-py3-none-any.whl (100 kB)
+Downloading pefile-2024.8.26-py3-none-any.whl (74 kB)
+Downloading pyinstaller_hooks_contrib-2026.5-py3-none-any.whl (457 kB)
+Using cached pywin32_ctypes-0.2.3-py3-none-any.whl (30 kB)
+Downloading setuptools-82.0.1-py3-none-any.whl (1.0 MB)
+   ---------------------------------------- 1.0/1.0 MB 9.5 MB/s eta 0:00:00
+Downloading altgraph-0.17.5-py2.py3-none-any.whl (21 kB)
+Using cached colorama-0.4.6-py2.py3-none-any.whl (25 kB)
+Installing collected packages: pyserial, altgraph, shiboken6, setuptools, pywin32-ctypes, pefile, packaging, numpy, colorama, cobs, scipy, PySide6_Essentials, pyqtgraph, pyinstaller-hooks-contrib, PySide6_Addons, PyInstaller, PySide6
+Successfully installed PyInstaller-6.20.0 PySide6-6.11.1 PySide6_Addons-6.11.1 PySide6_Essentials-6.11.1 altgraph-0.17.5 cobs-1.2.2 colorama-0.4.6 numpy-2.4.5 packaging-26.2 pefile-2024.8.26 pyinstaller-hooks-contrib-2026.5 pyqtgraph-0.14.0 pyserial-3.5 pywin32-ctypes-0.2.3 scipy-1.17.1 setuptools-82.0.1 shiboken6-6.11.1
+
+[notice] A new release of pip is available: 25.0.1 -> 26.1.1
+[notice] To update, run: python.exe -m pip install --upgrade pip
+=== ╨У╨╛╤В╨╛╨▓╨╛ ===
+Для продолжения нажмите любую клавишу . . .
