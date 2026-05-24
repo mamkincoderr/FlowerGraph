@@ -21,6 +21,10 @@ settings.json
 # Test recordings (не нужны в репо)
 *.fgd
 
+# Собранные дистрибутивы
+install/*.exe
+install/*.zip
+
 # OS
 .DS_Store
 Thumbs.db
