@@ -53,7 +53,7 @@ from ui.com_ascii_dialog import ComAsciiDialog
 from core.i18n import tr, set_lang, get_lang
 
 APP_NAME    = 'FlowerGraph'
-APP_VERSION = '0.6.3'
+APP_VERSION = '0.6.3.2'
 FILE_FILTER    = 'FlowerGraph Data (*.fgd);;Все файлы (*)'
 PGC_FILTER     = 'PowerGraph Data (*.pgc);;Все файлы (*)'
 
@@ -156,12 +156,15 @@ class MainWindow(QMainWindow):
         saved_lang = config.get('language', default='ru')
         set_lang(saved_lang)
 
+        self._restore_source_configs()
+
         self._setup_window()
         self._build_menu()
         self._build_toolbar()
         self._build_statusbar()
         self._build_central()
         self._restore_geometry()
+        self._restore_source_type()
 
         # Инициализировать метку масштаба
         self._nav_bar.update_scale_label(
@@ -252,6 +255,32 @@ class MainWindow(QMainWindow):
         cv.addWidget(self._stats_toggle_btn)
         cv.addWidget(self._nav_bar)
         self.setCentralWidget(central)
+
+    def _restore_source_configs(self):
+        """Загрузить последние настройки источников из конфига."""
+        d = config.get('source_ascii', default=None)
+        if isinstance(d, dict):
+            self._com_config = ComAsciiConfig.from_dict(d)
+
+        d = config.get('source_cobs', default=None)
+        if isinstance(d, dict):
+            self._cobs_config = ComCobsConfig.from_dict(d)
+
+        d = config.get('source_mcobs', default=None)
+        if isinstance(d, dict):
+            self._mcobs_config = ComMCobsConfig.from_dict(d)
+
+        d = config.get('source_generator', default=None)
+        if isinstance(d, dict):
+            self._gen_config = GeneratorConfig.from_dict(d)
+
+    def _restore_source_type(self):
+        """Восстановить последний выбранный тип источника в combo."""
+        saved = config.get('source_type', default=SourceType.GENERATOR.value)
+        for i in range(self._cb_source.count()):
+            if self._cb_source.itemData(i).value == saved:
+                self._cb_source.setCurrentIndex(i)
+                break
 
     def _restore_geometry(self):
         w = config.get('window')
@@ -1830,6 +1859,11 @@ class MainWindow(QMainWindow):
         config.set('window', 'maximized', value=self.isMaximized())
         config.set('splitter_sizes',      value=list(self._main_splitter.sizes()))
         config.set('center_splitter_sizes', value=list(self._center_splitter.sizes()))
+        config.set('source_type',      value=self._source_type.value)
+        config.set('source_ascii',     value=self._com_config.to_dict())
+        config.set('source_cobs',      value=self._cobs_config.to_dict())
+        config.set('source_mcobs',     value=self._mcobs_config.to_dict())
+        config.set('source_generator', value=self._gen_config.to_dict())
         config.save()
         super().closeEvent(event)
 

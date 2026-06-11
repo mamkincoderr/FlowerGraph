@@ -42,7 +42,7 @@ if errorlevel 1 (
     echo ОШИБКА: Inno Setup завершился с ошибкой.
     pause & exit /b 1
 )
-echo     OK — ..\install\FlowerGraph_Setup_0.6.3.exe
+echo     OK — ..\install\FlowerGraph_Setup_0.6.3.2.exe
 
 :portable
 REM --- 4. Portable ZIP (в папку ..\PGN\install) ---
@@ -50,7 +50,7 @@ echo [3/3] Создание portable ZIP...
 .venv\Scripts\python.exe -c "
 import zipfile, os, pathlib
 src = pathlib.Path('dist/FlowerGraph')
-out = pathlib.Path('../install/FlowerGraph_0.6.3_portable.zip')
+out = pathlib.Path('../install/FlowerGraph_0.6.3.2_portable.zip')
 out.parent.mkdir(parents=True, exist_ok=True)
 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
     for f in src.rglob('*'):
@@ -60,7 +60,7 @@ print(f'ZIP: {out}  ({out.stat().st_size//1024//1024} MB)')
 echo.
 echo =========================================
 echo  Готово!
-echo    Инсталлятор: ..\install\FlowerGraph_Setup_0.6.3.exe
-echo    Portable ZIP: ..\install\FlowerGraph_0.6.3_portable.zip
+echo    Инсталлятор: ..\install\FlowerGraph_Setup_0.6.3.2.exe
+echo    Portable ZIP: ..\install\FlowerGraph_0.6.3.2_portable.zip
 echo =========================================
 pause

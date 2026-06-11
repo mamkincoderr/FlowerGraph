@@ -1,27 +1,19 @@
 """
 COM-mCOBS источник данных — COBS с батчингом нескольких выборок в одном пакете.
 
-Формат пакета (uart_pgc.c, PG_PROTO=1, N_COBS_BATCH > 1):
+Структура пакета (конфигурируется в диалоге):
 
-  Сырые данные до COBS-кодирования:
-    [COUNT:1][Выб0_V0_L:1][Выб0_V0_H:1]...[ВыбK_VN_L:1][ВыбK_VN_H:1][CRC_L:1][CRC_H:1]
-    Итого: 3 + N_BATCH × 2 × N_Of_VARS байт
+  [COUNT:1]?  [Выб0_CH0…Выб0_CHN]  …  [ВыбK_CH0…ВыбK_CHN]  [CRC_L CRC_H]?
+   has_count   ←── BATCH × N_CH × bps байт ──────────────────►  use_crc
 
-  После COBS-кодирования + финальный 0x00 (делимитер):
-    Максимум: RAW + 2 байта
+  bps = 2 (int16/uint16) | 4 (int32/uint32/float32)
 
-  N_BATCH = число выборок в одном пакете (конфигурируется дефайном в прошивке)
-
-Пропускная способность vs COM COBS (N=4, 460800 бод):
-  N_BATCH=1  → ~2 862 выб/с  (= обычный COBS)
-  N_BATCH=2  → ~4 389 выб/с
-  N_BATCH=4  → ~4 983 выб/с  ★ рекомендуется
-  N_BATCH=8  → ~5 343 выб/с
-
-CRC-16/CCITT: poly=0x1021, init=0xFFFF
-COUNT: 8-битный счётчик пакетов, детектор потерь
+Пропускная способность (N=4, 460800 бод, int16, COUNT+CRC):
+  BATCH=1  → ~2 862 выб/с   BATCH=4  → ~4 983 выб/с ★
+  BATCH=2  → ~4 389 выб/с   BATCH=8  → ~5 343 выб/с
 """
 
+import math
 import queue
 import struct
 import threading
@@ -31,13 +23,12 @@ from dataclasses import dataclass, field
 import numpy as np
 import serial
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import (
-    QFormLayout, QSpinBox, QHBoxLayout, QLabel, QCheckBox
-)
+from PySide6.QtWidgets import QFormLayout, QSpinBox, QHBoxLayout, QLabel
 
 from plugins.base_source import BaseSource
 from plugins.com_cobs_source import (
-    ComCobsConfig, ComCobsDialog, _crc16, _cobs_decode
+    ComCobsConfig, ComCobsDialog, _crc16, _cobs_decode,
+    DATA_FORMATS, _FMT_LABELS, _FMT_SHORT, _STRUCT_FMT, _bps,
 )
 from plugins.com_ascii_source import ComAsciiConfig
 
@@ -48,23 +39,48 @@ from plugins.com_ascii_source import ComAsciiConfig
 
 @dataclass
 class ComMCobsConfig:
-    port:           str             = 'COM4'
-    baudrate:       int             = 460800
-    n_channels:     int             = 0          # 0 = авто
-    batch_size:     int             = 4          # N_COBS_BATCH в прошивке
-    use_crc:        bool            = True       # COBS_USE_CRC в прошивке
-    channel_names:  list[str] | None = field(default=None)
+    port:          str             = 'COM4'
+    baudrate:      int             = 460800
+    n_channels:    int             = 0           # 0 = авто
+    batch_size:    int             = 4           # N_COBS_BATCH в прошивке
+    has_count:     bool            = True        # байт COUNT присутствует
+    use_crc:       bool            = True        # CRC-16 в конце пакета
+    data_format:   str             = 'int16'     # тип данных каналов
+    channel_names: list[str] | None = field(default=None)
 
     def to_cobs_config(self) -> ComCobsConfig:
         return ComCobsConfig(
             port=self.port, baudrate=self.baudrate,
-            n_channels=self.n_channels, channel_names=self.channel_names,
+            n_channels=self.n_channels,
+            has_count=self.has_count, use_crc=self.use_crc,
+            data_format=self.data_format,
+            channel_names=self.channel_names,
         )
 
     def to_ascii_config(self) -> ComAsciiConfig:
         return ComAsciiConfig(
             port=self.port, baudrate=self.baudrate,
             n_channels=self.n_channels, channel_names=self.channel_names,
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            'port': self.port, 'baudrate': self.baudrate,
+            'n_channels': self.n_channels, 'batch_size': self.batch_size,
+            'has_count': self.has_count, 'use_crc': self.use_crc,
+            'data_format': self.data_format,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'ComMCobsConfig':
+        return cls(
+            port=d.get('port', 'COM4'),
+            baudrate=d.get('baudrate', 460800),
+            n_channels=d.get('n_channels', 0),
+            batch_size=d.get('batch_size', 4),
+            has_count=d.get('has_count', True),
+            use_crc=d.get('use_crc', True),
+            data_format=d.get('data_format', 'int16'),
         )
 
 
@@ -79,23 +95,23 @@ class ComMCobsSource(BaseSource):
     def __init__(self, config: ComMCobsConfig | None = None):
         super().__init__()
         self._config = config or ComMCobsConfig()
-        self._queue:  queue.Queue              = queue.Queue()
-        self._port:   serial.Serial | None     = None
-        self._thread: threading.Thread | None  = None
+        self._queue:  queue.Queue             = queue.Queue()
+        self._port:   serial.Serial | None    = None
+        self._thread: threading.Thread | None = None
 
-        self._pkt_ok        = 0
-        self._pkt_err_cobs  = 0
-        self._pkt_err_crc   = 0
-        self._pkt_lost      = 0
-        self._t_start       = 0.0
-        self._sample_count  = 0
+        self._pkt_ok       = 0
+        self._pkt_err_cobs = 0
+        self._pkt_err_crc  = 0
+        self._pkt_lost     = 0
+        self._t_start      = 0.0
+        self._sample_count = 0
 
-        self._n_ch_detected   = 0
-        self._batch_detected  = 0    # авто-определение из первого пакета
-        self._last_count      = -1
+        self._n_ch_detected  = 0
+        self._batch_detected = 0
+        self._last_count     = -1
 
-        self._rate_est  = 0.0
-        self._t_base    = 0.0
+        self._rate_est = 0.0
+        self._t_base   = 0.0
 
         self._reconnect_delay = 2.0
         self._reconnect_count = 0
@@ -103,8 +119,6 @@ class ComMCobsSource(BaseSource):
         self._drain_timer = QTimer()
         self._drain_timer.timeout.connect(self._drain_queue)
 
-    # ------------------------------------------------------------------
-    # BaseSource interface
     # ------------------------------------------------------------------
 
     def get_name(self) -> str:
@@ -134,18 +148,18 @@ class ComMCobsSource(BaseSource):
             self._emit_error(f'Не удалось открыть {self._config.port}: {e}')
             return
 
-        self._running         = True
-        self._t_start         = 0.0   # будет установлен по первому пакету
-        self._sample_count    = 0
-        self._pkt_ok          = 0
-        self._pkt_err_cobs    = 0
-        self._pkt_err_crc     = 0
-        self._pkt_lost        = 0
-        self._n_ch_detected   = self._config.n_channels
-        self._batch_detected  = 0
-        self._last_count      = -1
-        self._rate_est        = self._rate_from_baud()
-        self._t_base          = 0.0
+        self._running        = True
+        self._t_start        = 0.0
+        self._sample_count   = 0
+        self._pkt_ok         = 0
+        self._pkt_err_cobs   = 0
+        self._pkt_err_crc    = 0
+        self._pkt_lost       = 0
+        self._n_ch_detected  = self._config.n_channels
+        self._batch_detected = 0
+        self._last_count     = -1
+        self._rate_est       = self._rate_from_baud()
+        self._t_base         = 0.0
 
         while not self._queue.empty():
             try: self._queue.get_nowait()
@@ -171,17 +185,17 @@ class ComMCobsSource(BaseSource):
         return int(self._rate_est) if self._rate_est > 0 else 1000
 
     # ------------------------------------------------------------------
-    # Оценка частоты
-    # ------------------------------------------------------------------
 
     def _rate_from_baud(self) -> float:
         n_ch  = self._n_ch_detected or self._config.n_channels or 4
         batch = self._batch_detected or self._config.batch_size
-        overhead = 2 if self._config.use_crc else 1   # CRC16 + COUNT
-        raw_len = overhead + 1 + batch * 2 * n_ch     # +1 = COUNT
-        enc_len = raw_len + 2
+        hdr   = 1 if self._config.has_count else 0
+        ftr   = 2 if self._config.use_crc   else 0
+        bps_v = _bps(self._config.data_format)
+        raw_len  = hdr + ftr + batch * n_ch * bps_v
+        enc_len  = raw_len + 2
         pkt_rate = self._config.baudrate / (enc_len * 10.0)
-        return pkt_rate * batch   # выборок в секунду
+        return pkt_rate * batch
 
     def _calibrate_rate(self):
         elapsed = time.perf_counter() - self._t_start
@@ -193,8 +207,6 @@ class ComMCobsSource(BaseSource):
         self._rate_est = new_rate
 
     # ------------------------------------------------------------------
-    # Фоновый поток чтения
-    # ------------------------------------------------------------------
 
     def _read_loop(self):
         buf = bytearray()
@@ -205,9 +217,7 @@ class ComMCobsSource(BaseSource):
                     break
                 self._reconnect_count += 1
                 self._emit_error(
-                    f'Попытка реконнекта #{self._reconnect_count} '
-                    f'({self._config.port})…'
-                )
+                    f'Попытка реконнекта #{self._reconnect_count} ({self._config.port})…')
                 try:
                     self._port = serial.Serial(
                         port=self._config.port, baudrate=self._config.baudrate,
@@ -219,7 +229,6 @@ class ComMCobsSource(BaseSource):
                 except serial.SerialException:
                     pass
                 continue
-
             try:
                 waiting = self._port.in_waiting
                 if waiting:
@@ -247,8 +256,6 @@ class ComMCobsSource(BaseSource):
                 self._parse_packet(cobs_data)
 
     # ------------------------------------------------------------------
-    # Разбор пакета
-    # ------------------------------------------------------------------
 
     def _parse_packet(self, cobs_data: bytes):
         raw = _cobs_decode(cobs_data)
@@ -256,27 +263,21 @@ class ComMCobsSource(BaseSource):
             self._pkt_err_cobs += 1
             return
 
-        rlen = len(raw)
-        # Минимум: COUNT(1) + 1 выборка × 1 канал (2) + CRC(2) = 5 байт
-        min_len = 3 if self._config.use_crc else 1
-        if rlen < min_len + 2:
-            self._pkt_err_cobs += 1
-            return
+        rlen    = len(raw)
+        bps_val = _bps(self._config.data_format)
+        hdr     = 1 if self._config.has_count else 0
+        ftr     = 2 if self._config.use_crc   else 0
 
-        # Определить payload длину
-        payload_len = rlen - 1 - (2 if self._config.use_crc else 0)
-
-        # payload_len = batch × n_ch × 2  → должен делиться без остатка
-        if payload_len < 2 or payload_len % 2 != 0:
+        payload_len = rlen - hdr - ftr
+        if payload_len < bps_val or payload_len % bps_val != 0:
             self._pkt_err_cobs += 1
             return
 
         # Авто-определение n_ch и batch из первого пакета
         if self._n_ch_detected == 0:
-            # Определяем из batch_size (из конфига) и payload
             n_ch = self._config.n_channels or 4
-            if payload_len % (n_ch * 2) == 0:
-                batch = payload_len // (n_ch * 2)
+            if payload_len % (n_ch * bps_val) == 0:
+                batch = payload_len // (n_ch * bps_val)
                 self._n_ch_detected  = n_ch
                 self._batch_detected = batch
                 self._rate_est = self._rate_from_baud()
@@ -287,46 +288,48 @@ class ComMCobsSource(BaseSource):
         n_ch  = self._n_ch_detected
         batch = self._batch_detected or self._config.batch_size
 
-        if payload_len != batch * n_ch * 2:
+        if payload_len != batch * n_ch * bps_val:
             self._pkt_err_cobs += 1
             return
 
-        # CRC проверка
+        # CRC
         if self._config.use_crc:
-            crc_rx   = struct.unpack_from('<H', raw, 1 + payload_len)[0]
-            crc_calc = _crc16(raw[:1 + payload_len])
+            crc_rx   = struct.unpack_from('<H', raw, hdr + payload_len)[0]
+            crc_calc = _crc16(raw[:hdr + payload_len])
             if crc_rx != crc_calc:
                 self._pkt_err_crc += 1
                 return
 
-        # Детектирование потерь по COUNT
-        count = raw[0]
-        if self._last_count >= 0:
-            expected = (self._last_count + 1) & 0xFF
-            if count != expected:
-                lost = (count - expected) & 0xFF
-                self._pkt_lost += lost
-                self._emit_error(
-                    f'mCOBS: потеряно {lost} пакетов '
-                    f'(ожидался {expected}, получен {count})'
-                )
-        self._last_count = count
+        # COUNT / потери
+        if self._config.has_count:
+            count = raw[0]
+            if self._last_count >= 0:
+                expected = (self._last_count + 1) & 0xFF
+                if count != expected:
+                    lost = (count - expected) & 0xFF
+                    self._pkt_lost += lost
+                    self._emit_error(
+                        f'mCOBS: потеряно {lost} пакетов '
+                        f'(ожидался {expected}, получен {count})')
+            self._last_count = count
 
-        # Извлечь все выборки из батча
+        # Данные
+        sfmt    = _STRUCT_FMT[self._config.data_format]
+        is_f32  = self._config.data_format == 'float32'
         values_batch = np.empty((batch, n_ch), dtype=np.float32)
         for k in range(batch):
             for i in range(n_ch):
-                offset = 1 + (k * n_ch + i) * 2
-                v = struct.unpack_from('<h', raw, offset)[0]
+                offset = hdr + (k * n_ch + i) * bps_val
+                v = struct.unpack_from(sfmt, raw, offset)[0]
+                if is_f32 and not math.isfinite(v):
+                    v = 0.0
                 values_batch[k, i] = float(v)
 
-        # Первый пакет — фиксируем реальное время начала данных
         if self._sample_count == 0:
             self._t_start = time.perf_counter()
 
-        # Rate-locked timestamps для всех выборок батча
-        t0 = self._t_base + self._sample_count / self._rate_est
-        dt = 1.0 / self._rate_est
+        t0    = self._t_base + self._sample_count / self._rate_est
+        dt    = 1.0 / self._rate_est
         times = np.array([t0 + k * dt for k in range(batch)], dtype=np.float64)
         self._sample_count += batch
 
@@ -337,8 +340,6 @@ class ComMCobsSource(BaseSource):
         self._pkt_ok += 1
 
     # ------------------------------------------------------------------
-    # Дренаж очереди
-    # ------------------------------------------------------------------
 
     def _drain_queue(self):
         while True:
@@ -348,24 +349,16 @@ class ComMCobsSource(BaseSource):
             except queue.Empty:
                 break
 
-    # ------------------------------------------------------------------
-    # Статистика
-    # ------------------------------------------------------------------
-
     @property
     def stats(self) -> dict:
         elapsed = max(0.001, time.perf_counter() - self._t_start)
         return {
-            'port':          self._config.port,
-            'baudrate':      self._config.baudrate,
-            'n_ch':          self._n_ch_detected,
-            'batch':         self._batch_detected,
-            'pkt_ok':        self._pkt_ok,
-            'pkt_err_cobs':  self._pkt_err_cobs,
-            'pkt_err_crc':   self._pkt_err_crc,
-            'pkt_lost':      self._pkt_lost,
-            'sample_rate':   int(self._rate_est),
-            'elapsed':       elapsed,
+            'port': self._config.port, 'baudrate': self._config.baudrate,
+            'n_ch': self._n_ch_detected, 'batch': self._batch_detected,
+            'pkt_ok': self._pkt_ok,
+            'pkt_err_cobs': self._pkt_err_cobs, 'pkt_err_crc': self._pkt_err_crc,
+            'pkt_lost': self._pkt_lost,
+            'sample_rate': int(self._rate_est), 'elapsed': elapsed,
         }
 
 
@@ -374,23 +367,24 @@ class ComMCobsSource(BaseSource):
 # ---------------------------------------------------------------------------
 
 class ComMCobsDialog(ComCobsDialog):
+
     def __init__(self, config: ComMCobsConfig | None = None, parent=None):
         self._mcobs_config = config or ComMCobsConfig()
+        # Передаём COBS-конфиг с правильными значениями has_count/use_crc/data_format
         super().__init__(self._mcobs_config.to_cobs_config(), parent=parent)
         self.setWindowTitle('Настройка COM-mCOBS источника')
         self._add_mcobs_widgets()
 
     def _add_mcobs_widgets(self):
-        # Найти groupbox параметров порта и добавить в него поля mCOBS
         from PySide6.QtWidgets import QGroupBox
         for child in self.children():
             if isinstance(child, QGroupBox) and 'орт' in (child.title() or ''):
                 form = child.layout()
-                if form is None:
+                if not isinstance(form, QFormLayout):
                     continue
 
-                # Выборок в пакете
-                batch_h = QHBoxLayout()
+                # Вставляем «Выборок в пакете» ПЕРЕД строкой COUNT (3 строки с конца)
+                batch_row = QHBoxLayout()
                 self._sb_batch = QSpinBox()
                 self._sb_batch.setRange(1, 64)
                 self._sb_batch.setValue(self._mcobs_config.batch_size)
@@ -399,35 +393,32 @@ class ComMCobsDialog(ComCobsDialog):
                     'N_COBS_BATCH в прошивке.\n'
                     '1 = обычный COBS, 4 = рекомендуется, 8 = максимум'
                 )
-                batch_h.addWidget(self._sb_batch)
-                batch_h.addWidget(QLabel('(N_COBS_BATCH в прошивке)'))
-                batch_h.addStretch()
-                form.addRow('Выборок в пакете:', batch_h)
+                self._sb_batch.valueChanged.connect(self._update_diagram)
+                batch_row.addWidget(self._sb_batch)
+                batch_row.addWidget(QLabel('(N_COBS_BATCH в прошивке)'))
+                batch_row.addStretch()
 
-                # CRC
-                self._chk_crc = QCheckBox('CRC-16/CCITT в пакете (COBS_USE_CRC=1)')
-                self._chk_crc.setChecked(self._mcobs_config.use_crc)
-                self._chk_crc.setToolTip(
-                    'Совпадает с COBS_USE_CRC в uart_pgc.h.\n'
-                    'Отключение ускоряет передачу на ~5%.'
-                )
-                form.addRow('', self._chk_crc)
+                # COUNT, data_format, CRC — 3 последних строки → вставляем перед ними
+                form.insertRow(form.rowCount() - 3, 'Выборок в пакете:', batch_row)
                 break
 
     def get_mcobs_config(self) -> ComMCobsConfig:
-        base = self.get_config()
+        cobs  = self.get_cobs_config()   # читает has_count, use_crc, data_format
         batch = getattr(self, '_sb_batch', None)
-        crc   = getattr(self, '_chk_crc', None)
         return ComMCobsConfig(
-            port          = base.port,
-            baudrate      = base.baudrate,
-            n_channels    = base.n_channels,
-            batch_size    = batch.value() if batch else self._mcobs_config.batch_size,
-            use_crc       = crc.isChecked() if crc else self._mcobs_config.use_crc,
-            channel_names = self._mcobs_config.channel_names,
+            port        = cobs.port,
+            baudrate    = cobs.baudrate,
+            n_channels  = cobs.n_channels,
+            batch_size  = batch.value() if batch else self._mcobs_config.batch_size,
+            has_count   = cobs.has_count,
+            use_crc     = cobs.use_crc,
+            data_format = cobs.data_format,
         )
 
-    # Переопределяем предпросмотр — показываем mCOBS пакеты
+    # ------------------------------------------------------------------
+    # Предпросмотр mCOBS
+    # ------------------------------------------------------------------
+
     def _flush_preview(self):
         while True:
             delim = self._preview_buf.find(0x00)
@@ -448,41 +439,52 @@ class ComMCobsDialog(ComCobsDialog):
             return
 
         rlen = len(raw)
-        batch_size = getattr(self, '_sb_batch', None)
-        batch = batch_size.value() if batch_size else 4
-        use_crc = getattr(self, '_chk_crc', None)
-        crc_on = use_crc.isChecked() if use_crc else True
+        batch_sb  = getattr(self, '_sb_batch', None)
+        batch     = batch_sb.value() if batch_sb else 4
+        has_count = self._chk_count.isChecked() if hasattr(self, '_chk_count') else True
+        use_crc   = self._chk_crc.isChecked()   if hasattr(self, '_chk_crc')   else True
+        data_fmt  = self._cb_format.currentData() if hasattr(self, '_cb_format') else 'int16'
+        bps_val   = _bps(data_fmt)
+        sfmt      = _STRUCT_FMT[data_fmt]
+        fsht      = _FMT_SHORT[data_fmt]
 
-        payload_len = rlen - 1 - (2 if crc_on else 0)
-        if payload_len < 2 or payload_len % 2 != 0:
-            self._prev_log(f'RAW: {hex_str}  →  [неверная длина {rlen}]', '#ce9178')
+        hdr = 1 if has_count else 0
+        ftr = 2 if use_crc   else 0
+        payload_len = rlen - hdr - ftr
+
+        if payload_len < bps_val or payload_len % bps_val != 0:
+            self._prev_log(
+                f'RAW [{len(cobs_data)}б]: {hex_str}  →  [длина {rlen}б не соответствует]',
+                '#ce9178')
             return
 
-        n_ch = payload_len // (batch * 2) if payload_len % (batch * 2) == 0 else 0
+        n_ch = payload_len // (batch * bps_val) if payload_len % (batch * bps_val) == 0 else 0
         if n_ch == 0:
-            self._prev_log(f'RAW [{len(cobs_data)}б]: {hex_str}  →  [не совпадает с batch={batch}]', '#ce9178')
+            self._prev_log(
+                f'RAW [{len(cobs_data)}б]: {hex_str}  →  [не совпадает batch={batch} fmt={fsht}]',
+                '#ce9178')
             return
 
-        if crc_on:
-            crc_rx   = struct.unpack_from('<H', raw, 1 + payload_len)[0]
-            crc_ok   = _crc16(raw[:1 + payload_len]) == crc_rx
+        if use_crc:
+            crc_rx  = struct.unpack_from('<H', raw, hdr + payload_len)[0]
+            crc_ok  = _crc16(raw[:hdr + payload_len]) == crc_rx
+            crc_str = 'CRC=OK' if crc_ok else f'CRC=ERR(rx={crc_rx:04X})'
         else:
-            crc_ok   = True
-            crc_rx   = 0
+            crc_ok, crc_str = True, 'no CRC'
 
-        count = raw[0]
-        lines = [f'RAW [{len(cobs_data)}б]: {hex_str}']
-        lines.append(f'     CNT={count:3d}  batch={batch}  N={n_ch}  {"CRC=OK" if crc_ok else f"CRC=ERR(rx={crc_rx:04X})"}')
+        cnt_str = f'CNT={raw[0]:3d}  ' if has_count else ''
+        lines   = [f'RAW [{len(cobs_data)}б]: {hex_str}']
+        lines.append(f'     {cnt_str}batch={batch}  N={n_ch}  {fsht}  {crc_str}')
 
         for k in range(batch):
             vals = []
             for i in range(n_ch):
-                v = struct.unpack_from('<h', raw, 1 + (k*n_ch + i)*2)[0]
-                vals.append(f'CH{i+1}={v:7d}')
+                v = struct.unpack_from(sfmt, raw, hdr + (k * n_ch + i) * bps_val)[0]
+                if data_fmt == 'float32':
+                    vals.append(f'CH{i+1}={v:10.4f}')
+                else:
+                    vals.append(f'CH{i+1}={v:8d}')
             lines.append(f'     выб.{k}: {" ".join(vals)}')
 
-        import struct as _struct
         color = '#9cdcfe' if crc_ok else '#f66'
         self._prev_log('\n'.join(lines), color)
-
-import struct  # нужен в _show_mcobs_packet

@@ -38,6 +38,17 @@ class ComAsciiConfig:
     n_channels:   int = 0          # 0 = авто-определение по первому пакету
     channel_names: list[str] | None = None
 
+    def to_dict(self) -> dict:
+        return {'port': self.port, 'baudrate': self.baudrate, 'n_channels': self.n_channels}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'ComAsciiConfig':
+        return cls(
+            port=d.get('port', 'COM4'),
+            baudrate=d.get('baudrate', 460800),
+            n_channels=d.get('n_channels', 0),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Плагин

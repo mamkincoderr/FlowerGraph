@@ -24,6 +24,15 @@ class ChannelConfig:
     frequency: float = 1.0
     noise_std: float = 0.0
 
+    def to_dict(self) -> dict:
+        return {'waveform': self.waveform, 'amplitude': self.amplitude,
+                'frequency': self.frequency, 'noise_std': self.noise_std}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'ChannelConfig':
+        return cls(waveform=d.get('waveform', 'sine'), amplitude=d.get('amplitude', 1.0),
+                   frequency=d.get('frequency', 1.0), noise_std=d.get('noise_std', 0.0))
+
 
 @dataclass
 class GeneratorConfig:
@@ -37,6 +46,21 @@ class GeneratorConfig:
             ChannelConfig(waveform='sawtooth', amplitude=1.0, frequency=33.0),
         ]
     )
+
+    def to_dict(self) -> dict:
+        return {
+            'n_channels': self.n_channels,
+            'sample_rate': self.sample_rate,
+            'channels': [c.to_dict() for c in self.channels[:self.n_channels]],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'GeneratorConfig':
+        channels = [ChannelConfig.from_dict(c) for c in d.get('channels', [])]
+        n = d.get('n_channels', 4)
+        while len(channels) < n:
+            channels.append(ChannelConfig())
+        return cls(n_channels=n, sample_rate=d.get('sample_rate', 10_000), channels=channels[:n])
 
 
 class VirtualGenerator(BaseSource):
