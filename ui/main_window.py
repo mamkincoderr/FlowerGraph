@@ -25,12 +25,14 @@ from PySide6.QtWidgets import (
     QMainWindow, QStatusBar, QMenuBar, QToolBar,
     QLabel, QMessageBox, QComboBox, QWidget,
     QHBoxLayout, QVBoxLayout, QSplitter, QPushButton,
-    QListWidget, QListWidgetItem, QFileDialog, QInputDialog
+    QListWidget, QListWidgetItem, QFileDialog, QInputDialog,
+    QSystemTrayIcon, QMenu,
 )
 from PySide6.QtCore import QSize, QTimer, Qt
-from PySide6.QtGui import QAction, QKeySequence, QIcon
+from PySide6.QtGui import QAction, QKeySequence
 
 from core.config import config
+from core.app_icon import app_icon
 from core.session import Session, Block, ChannelInfo
 from core import file_io
 from core import calib_file
@@ -159,6 +161,7 @@ class MainWindow(QMainWindow):
         self._restore_source_configs()
 
         self._setup_window()
+        self._setup_tray()
         self._build_menu()
         self._build_toolbar()
         self._build_statusbar()
@@ -189,9 +192,42 @@ class MainWindow(QMainWindow):
     def _setup_window(self):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(1000, 680)
-        icon_path = Path(__file__).resolve().parent.parent / 'assets' / 'icon.ico'
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
+        icon = app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
+
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = None
+            return
+        icon = app_icon()
+        self._tray = QSystemTrayIcon(self)
+        if not icon.isNull():
+            self._tray.setIcon(icon)
+        self._tray.setToolTip(APP_NAME)
+        menu = QMenu(self)
+        act_show = QAction('Показать', self)
+        act_show.triggered.connect(self._show_from_tray)
+        act_quit = QAction('Выход', self)
+        act_quit.triggered.connect(self.close)
+        menu.addAction(act_show)
+        menu.addSeparator()
+        menu.addAction(act_quit)
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._show_from_tray()
 
     def _build_central(self):
         # Левая панель: шкала амплитуды
@@ -1868,6 +1904,8 @@ class MainWindow(QMainWindow):
         config.set('source_mcobs',     value=self._mcobs_config.to_dict())
         config.set('source_generator', value=self._gen_config.to_dict())
         config.save()
+        if getattr(self, '_tray', None) is not None:
+            self._tray.hide()
         super().closeEvent(event)
 
 

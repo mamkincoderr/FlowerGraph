@@ -29,6 +29,7 @@ a = Analysis(
         'core.ring_buffer',
         'core.session',
         'core.file_io',
+        'core.app_icon',
         'ui.main_window',
         'ui.plot_area',
         'ui.channel_panel',
@@ -91,6 +92,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/icon.ico',
 )
 
 coll = COLLECT(

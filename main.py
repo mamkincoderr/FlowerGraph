@@ -7,6 +7,7 @@ import pyqtgraph as pg
 from PySide6.QtWidgets import QApplication, QSplashScreen
 from PySide6.QtGui import QPixmap
 from PySide6.QtCore import Qt, QTimer
+from core.app_icon import app_icon
 from ui.main_window import MainWindow, APP_NAME
 
 pg.setConfigOption('background', 'w')
@@ -108,6 +109,15 @@ def _setup_logging():
 # ---------------------------------------------------------------------------
 
 def main():
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                'FlowerGraph.Desktop.0.6'
+            )
+        except Exception:
+            pass
+
     _setup_logging()
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -116,6 +126,9 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName('FlowerGraph')
+    icon = app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
 
     # Сплеш-экран
     splash = None

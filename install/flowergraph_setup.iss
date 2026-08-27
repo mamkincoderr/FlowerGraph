@@ -29,6 +29,8 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 MinVersion=10.0.17763
+SetupIconFile=..\assets\icon.ico
+UninstallDisplayIcon={app}\{#AppExeName}
 ; Windows 10 1809 как минимум (поддержка WinRT нужна для PySide6)
 
 [Languages]
