@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QDialogButtonBox, QTableWidget,
     QTableWidgetItem, QGroupBox, QHeaderView
 )
-from plugins.base_source import BaseSource
+from plugins.base_source import BaseSource, put_drop_oldest
 
 
 WAVEFORM_LABELS = ['Синус', 'Меандр', 'Пила', 'Шум', 'Постоянный']
@@ -73,7 +73,7 @@ class VirtualGenerator(BaseSource):
         self._phases        = np.zeros(self._config.n_channels)
         self._sample_count  = 0
         self._thread: threading.Thread | None = None
-        self._queue: queue.Queue = queue.Queue()
+        self._queue: queue.Queue = queue.Queue(maxsize=512)
 
         # Таймер в главном потоке — сливает очередь в UI-коллбэк
         self._drain_timer = QTimer()
@@ -108,6 +108,7 @@ class VirtualGenerator(BaseSource):
         self._thread.start()
         # Главный поток сливает очередь каждые _DRAIN_MS
         self._drain_timer.start(self._DRAIN_MS)
+        return True
 
     def stop(self):
         self._running = False
@@ -157,10 +158,10 @@ class VirtualGenerator(BaseSource):
             values[:, i] = self._make_wave(ch, n, i)
 
         # Кладём в очередь (thread-safe); главный поток заберёт
-        self._queue.put((times, values))
+        put_drop_oldest(self._queue, (times, values))
 
     def _drain_queue(self):
-        """Вызывается в главном потоке — сливает всё накопленное за интервал."""
+        self._drain_errors()
         while True:
             try:
                 times, values = self._queue.get_nowait()

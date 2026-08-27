@@ -2,7 +2,7 @@
 ; Компилируется: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" flowergraph_setup.iss
 
 #define AppName      "FlowerGraph"
-#define AppVersion   "0.6.3.2"
+#define AppVersion   "0.7.0"
 #define AppPublisher "FlowerGraph"
 #define AppURL       ""
 #define AppExeName   "FlowerGraph.exe"
@@ -29,6 +29,8 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 MinVersion=10.0.17763
+SetupIconFile=..\assets\icon.ico
+UninstallDisplayIcon={app}\{#AppExeName}
 ; Windows 10 1809 как минимум (поддержка WinRT нужна для PySide6)
 
 [Languages]
@@ -44,14 +46,12 @@ Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs cr
 [Icons]
 Name: "{group}\{#AppName}";        Filename: "{app}\{#AppExeName}"
 Name: "{group}\Удалить {#AppName}"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
-[UninstallDelete]
-; Очищаем AppData при удалении (конфиг программы)
-Type: filesandordirs; Name: "{userappdata}\FlowerGraph"
+; AppData не трогаем при uninstall — там настройки пользователя
 
 [Code]
 // Проверяем наличие Visual C++ Redistributable (нужен для PySide6)

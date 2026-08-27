@@ -1,7 +1,5 @@
 PySide6>=6.7.0
 pyqtgraph>=0.13.7
 numpy>=1.26.0
-scipy>=1.13.0
 pyserial>=3.5
-cobs>=1.2.0
 PyInstaller>=6.6.0

@@ -17,18 +17,15 @@ a = Analysis(
     binaries=[],
     datas=pyqtgraph_datas + [('assets', 'assets')],
     hiddenimports=[
-        # scipy
-        'scipy.signal',
-        'scipy.fft',
-        'scipy._lib.messagestream',
-        # pyserial / cobs
         'serial',
-        'cobs',
+        'serial.tools.list_ports',
+        'pyqtgraph.exporters',
         # наши пакеты
         'core.config',
         'core.ring_buffer',
         'core.session',
         'core.file_io',
+        'core.app_icon',
         'ui.main_window',
         'ui.plot_area',
         'ui.channel_panel',
@@ -67,6 +64,8 @@ a = Analysis(
         'PySide6.QtXml',
         'tkinter',
         'matplotlib',
+        'scipy',
+        'cobs',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -85,12 +84,13 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/icon.ico',
 )
 
 coll = COLLECT(
@@ -99,7 +99,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='FlowerGraph',
 )

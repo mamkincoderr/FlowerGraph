@@ -25,7 +25,7 @@ import serial
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QFormLayout, QSpinBox, QHBoxLayout, QLabel
 
-from plugins.base_source import BaseSource
+from plugins.base_source import BaseSource, put_drop_oldest
 from plugins.com_cobs_source import (
     ComCobsConfig, ComCobsDialog, _crc16, _cobs_decode,
     DATA_FORMATS, _FMT_LABELS, _FMT_SHORT, _STRUCT_FMT, _bps,
@@ -95,7 +95,7 @@ class ComMCobsSource(BaseSource):
     def __init__(self, config: ComMCobsConfig | None = None):
         super().__init__()
         self._config = config or ComMCobsConfig()
-        self._queue:  queue.Queue             = queue.Queue()
+        self._queue:  queue.Queue             = queue.Queue(maxsize=512)
         self._port:   serial.Serial | None    = None
         self._thread: threading.Thread | None = None
 
@@ -146,7 +146,8 @@ class ComMCobsSource(BaseSource):
             )
         except serial.SerialException as e:
             self._emit_error(f'Не удалось открыть {self._config.port}: {e}')
-            return
+            self._drain_errors()
+            return False
 
         self._running        = True
         self._t_start        = 0.0
@@ -168,6 +169,7 @@ class ComMCobsSource(BaseSource):
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
         self._drain_timer.start(self._DRAIN_MS)
+        return True
 
     def stop(self):
         self._running = False
@@ -273,17 +275,20 @@ class ComMCobsSource(BaseSource):
             self._pkt_err_cobs += 1
             return
 
-        # Авто-определение n_ch и batch из первого пакета
+        # Авто-определение n_ch из payload при известном batch_size
         if self._n_ch_detected == 0:
-            n_ch = self._config.n_channels or 4
-            if payload_len % (n_ch * bps_val) == 0:
-                batch = payload_len // (n_ch * bps_val)
-                self._n_ch_detected  = n_ch
-                self._batch_detected = batch
-                self._rate_est = self._rate_from_baud()
-            else:
+            batch = max(1, int(self._config.batch_size or 1))
+            unit = batch * bps_val
+            if payload_len % unit != 0:
                 self._pkt_err_cobs += 1
                 return
+            n_ch = payload_len // unit
+            if n_ch < 1:
+                self._pkt_err_cobs += 1
+                return
+            self._n_ch_detected  = n_ch
+            self._batch_detected = batch
+            self._rate_est = self._rate_from_baud()
 
         n_ch  = self._n_ch_detected
         batch = self._batch_detected or self._config.batch_size
@@ -336,12 +341,13 @@ class ComMCobsSource(BaseSource):
         if self._sample_count % self._RECAL_AT < batch:
             self._calibrate_rate()
 
-        self._queue.put((times, values_batch))
+        put_drop_oldest(self._queue, (times, values_batch))
         self._pkt_ok += 1
 
     # ------------------------------------------------------------------
 
     def _drain_queue(self):
+        self._drain_errors()
         while True:
             try:
                 times, values = self._queue.get_nowait()

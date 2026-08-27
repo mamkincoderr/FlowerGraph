@@ -73,9 +73,13 @@ def load(path: str | Path) -> Block:
     ring_depth    = struct.unpack_from('<I', data, 0x14)[0]
     src_name_len  = struct.unpack_from('<H', data, 0x28)[0]
     src_name      = data[0x2A : 0x2A + src_name_len].decode('ascii', errors='replace')
+    if n_active < 1:
+        raise ValueError('PGC: нет активных каналов')
 
     # --- ADCh: масштаб/смещение для каждого активного канала ---
-    adch_off = data.index(_SIG_ADCH)
+    adch_off = data.find(_SIG_ADCH, 0x89)
+    if adch_off < 0:
+        raise ValueError('PGC: нет секции ADCh')
     scales  = {}
     offsets = {}
     for slot in range(_ADCH_N_SLOTS):
@@ -89,18 +93,25 @@ def load(path: str | Path) -> Block:
         offsets[ch_idx] = offset
 
     # --- ADBl: частота дискретизации ---
-    adbl_off    = data.index(_SIG_ADBL)
+    adbl_off = data.find(_SIG_ADBL, adch_off)
+    if adbl_off < 0:
+        raise ValueError('PGC: нет секции ADBl')
     sample_rate_f = struct.unpack_from('<f', data, adbl_off + 8)[0]
     sample_rate = max(1, round(sample_rate_f))
 
     # --- data: сырые int16 сэмплы ---
-    dtag_off  = data.index(_SIG_DATA)
+    dtag_off = data.find(_SIG_DATA, adbl_off)
+    if dtag_off < 0:
+        raise ValueError('PGC: нет секции data')
     data_len  = struct.unpack_from('<I', data, dtag_off + 4)[0]
     data_start = dtag_off + 8
+    stride = n_active * 2
+    if stride < 1 or data_len < stride or data_len % stride != 0:
+        raise ValueError('PGC: повреждён блок data')
 
-    n_samples = data_len // (n_active * 2)
+    n_samples = data_len // stride
     raw = np.frombuffer(
-        data[data_start : data_start + n_samples * n_active * 2],
+        data[data_start : data_start + n_samples * stride],
         dtype='<i2',
     ).reshape(n_samples, n_active)
 
@@ -112,7 +123,7 @@ def load(path: str | Path) -> Block:
         s = scales.get(c, 1.0)
         o = offsets.get(c, 0.0)
         values[:, c] = col * s + o
-        channels.append(ChannelInfo(name=f'CH{c + 1}'))
+        channels.append(ChannelInfo(name=f'CH{c + 1}', scale=1.0, offset=0.0))
 
     dt    = 1.0 / sample_rate
     times = np.arange(n_samples, dtype=np.float64) * dt

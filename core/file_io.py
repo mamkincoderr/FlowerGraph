@@ -8,6 +8,7 @@
 
 import io
 import json
+import os
 import zipfile
 from pathlib import Path
 
@@ -34,7 +35,8 @@ def save(session: Session, path: str | Path) -> None:
         'n_blocks': session.n_blocks,
     }
 
-    with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr('_meta.json', json.dumps(meta, ensure_ascii=False))
 
         for i, block in enumerate(session.blocks):
@@ -57,6 +59,7 @@ def save(session: Session, path: str | Path) -> None:
             zf.writestr(f'b{i}_times.npy',  _arr_to_bytes(block.times.astype(np.float64)))
             zf.writestr(f'b{i}_values.npy', _arr_to_bytes(block.values.astype(np.float32)))
 
+    os.replace(tmp, path)
     session.file_path = str(path)
     session.modified  = False
 
@@ -79,6 +82,8 @@ def load(path: str | Path) -> Session:
             bm      = json.loads(zf.read(f'b{i}_meta.json'))
             times   = _bytes_to_arr(zf.read(f'b{i}_times.npy'))
             values  = _bytes_to_arr(zf.read(f'b{i}_values.npy'))
+            if times.ndim != 1 or values.ndim != 2 or times.shape[0] != values.shape[0]:
+                raise ValueError(f'.fgd: блок {i} — несовпадение размеров times/values')
 
             channels = [
                 ChannelInfo(
@@ -89,6 +94,8 @@ def load(path: str | Path) -> Session:
                 )
                 for c in bm['channels']
             ]
+            if values.shape[1] != len(channels):
+                raise ValueError(f'.fgd: блок {i} — число каналов не совпадает')
             annotations = [
                 Annotation(t=a['t'], text=a['text'])
                 for a in bm.get('annotations', [])
@@ -121,7 +128,7 @@ def _arr_to_bytes(arr: np.ndarray) -> bytes:
 
 
 def _bytes_to_arr(data: bytes) -> np.ndarray:
-    return np.load(io.BytesIO(data))
+    return np.load(io.BytesIO(data), allow_pickle=False)
 
 
 def _require_version(v: int):

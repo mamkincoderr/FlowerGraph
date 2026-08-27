@@ -6,169 +6,119 @@ on:
     tags: [ 'v*' ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
   extract-version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       version: ${{ steps.extract.outputs.version }}
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Extract version from main.py
-      id: extract
-      run: |
-        VERSION=$(grep "APP_VERSION = " ui/main_window.py | grep -oP "'\K[^']+")
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
-        echo "📌 Version: $VERSION"
+      - uses: actions/checkout@v4
+      - name: Extract version
+        id: extract
+        run: |
+          VER=$(python -c "import re; m=re.search(r\"APP_VERSION = '(.+?)'\", open('ui/main_window.py').read()); print(m.group(1))")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
 
   build-windows:
-    needs: extract-version
+    needs: [test, extract-version]
     runs-on: windows-latest
-    strategy:
-      matrix:
-        python-version: ['3.11']
-
     steps:
-    - uses: actions/checkout@v3
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python-version }}
-        cache: 'pip'
-
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-
-    - name: Build with PyInstaller
-      run: |
-        pyinstaller FlowerGraph.spec --clean --distpath ./dist_win
-
-    - name: Create portable archive (Windows)
-      run: |
-        mkdir -p build_output
-        cd dist_win
-        7z a -r ../build_output/FlowerGraph_${{ needs.extract-version.outputs.version }}_windows.zip FlowerGraph/
-        cd ..
-        dir build_output
-
-    - name: Upload Windows artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: FlowerGraph-Windows-${{ needs.extract-version.outputs.version }}
-        path: build_output/FlowerGraph_${{ needs.extract-version.outputs.version }}_windows.zip
-        retention-days: 7
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Build with PyInstaller
+        run: pyinstaller FlowerGraph.spec --clean --noconfirm
+      - name: Zip portable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build_output | Out-Null
+          Compress-Archive -Path dist\FlowerGraph -DestinationPath "build_output\FlowerGraph_${{ needs.extract-version.outputs.version }}_windows.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlowerGraph-Windows-${{ needs.extract-version.outputs.version }}
+          path: build_output/FlowerGraph_${{ needs.extract-version.outputs.version }}_windows.zip
+          retention-days: 14
 
   build-linux:
-    needs: extract-version
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ['3.11']
-
+    needs: [test, extract-version]
+    runs-on: ubuntu-22.04
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-cursor0 libxcb-xinerama0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 \
+            libegl1 libgl1 libglib2.0-0
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Build with PyInstaller
+        run: pyinstaller FlowerGraph.spec --clean --noconfirm
+      - name: Tar portable
+        run: |
+          mkdir -p build_output
+          tar -czf "build_output/FlowerGraph_${{ needs.extract-version.outputs.version }}_linux.tar.gz" -C dist FlowerGraph
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlowerGraph-Linux-${{ needs.extract-version.outputs.version }}
+          path: build_output/FlowerGraph_${{ needs.extract-version.outputs.version }}_linux.tar.gz
+          retention-days: 14
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python-version }}
-        cache: 'pip'
-
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libgles2-mesa libgl1-mesa-glx xvfb
-
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-
-    - name: Build with PyInstaller
-      run: |
-        pyinstaller FlowerGraph.spec --clean --distpath ./dist_linux
-
-    - name: Create portable archive (Linux)
-      run: |
-        mkdir -p build_output
-        tar -czf build_output/FlowerGraph_${{ needs.extract-version.outputs.version }}_linux.tar.gz -C dist_linux FlowerGraph/
-        ls -lh build_output/
-
-    - name: Upload Linux artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: FlowerGraph-Linux-${{ needs.extract-version.outputs.version }}
-        path: build_output/FlowerGraph_${{ needs.extract-version.outputs.version }}_linux.tar.gz
-        retention-days: 7
-
-  push-to-releases:
+  github-release:
     needs: [extract-version, build-windows, build-linux]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/v')
-
     steps:
-    - name: Download Windows artifact
-      uses: actions/download-artifact@v3
-      with:
-        name: FlowerGraph-Windows-${{ needs.extract-version.outputs.version }}
-        path: ./artifacts/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: FlowerGraph-Windows-${{ needs.extract-version.outputs.version }}
+          path: ./artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: FlowerGraph-Linux-${{ needs.extract-version.outputs.version }}
+          path: ./artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          name: FlowerGraph v${{ needs.extract-version.outputs.version }}
+          body: |
+            Portable builds — распаковать и запустить.
 
-    - name: Download Linux artifact
-      uses: actions/download-artifact@v3
-      with:
-        name: FlowerGraph-Linux-${{ needs.extract-version.outputs.version }}
-        path: ./artifacts/linux
+            - `FlowerGraph_${{ needs.extract-version.outputs.version }}_windows.zip` — Windows 10/11 x64
+            - `FlowerGraph_${{ needs.extract-version.outputs.version }}_linux.tar.gz` — Linux
 
-    - name: Checkout releases repo
-      uses: actions/checkout@v3
-      with:
-        repository: mamkincoderr/FlowerGraph-releases
-        token: ${{ secrets.GITHUB_TOKEN }}
-        path: releases-repo
-
-    - name: Copy files to releases repo
-      run: |
-        mkdir -p releases-repo/releases/${{ needs.extract-version.outputs.version }}
-        cp artifacts/windows/* releases-repo/releases/${{ needs.extract-version.outputs.version }}/
-        cp artifacts/linux/* releases-repo/releases/${{ needs.extract-version.outputs.version }}/
-        ls -lhR releases-repo/releases/
-
-    - name: Commit and push to releases repo
-      working-directory: releases-repo
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add -A
-        git commit -m "Release FlowerGraph v${{ needs.extract-version.outputs.version }}" || echo "Nothing to commit"
-        git push
-
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
-      with:
-        repository: mamkincoderr/FlowerGraph-releases
-        files: |
-          artifacts/windows/*
-          artifacts/linux/*
-        tag_name: v${{ needs.extract-version.outputs.version }}
-        name: FlowerGraph v${{ needs.extract-version.outputs.version }}
-        body: |
-          ## FlowerGraph v${{ needs.extract-version.outputs.version }}
-          
-          **Portable builds** - распаковать и запустить, установка не требуется.
-          
-          ### 📦 Файлы:
-          - `FlowerGraph_${{ needs.extract-version.outputs.version }}_windows.zip` — Windows portable
-          - `FlowerGraph_${{ needs.extract-version.outputs.version }}_linux.tar.gz` — Linux portable
-          
-          ### 🔧 Системные требования:
-          - **Windows**: 10 x64 (1809+)
-          - **Linux**: гмф, на что угодно работает
-          
-          ### 🚀 Запуск:
-          **Windows**: распаковать, запустить `FlowerGraph.exe`
-          **Linux**: распаковать, запустить `./FlowerGraph`
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            Windows: `FlowerGraph.exe`
+            Linux: `./FlowerGraph`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

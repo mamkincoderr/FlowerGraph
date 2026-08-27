@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QLabel, QSizePolicy,
 )
 
-from plugins.base_source import BaseSource
+from plugins.base_source import BaseSource, put_drop_oldest
 from ui.com_ascii_dialog import ComAsciiDialog
 from plugins.com_ascii_source import ComAsciiConfig
 
@@ -303,7 +303,7 @@ class ComCobsSource(BaseSource):
     def __init__(self, config: ComCobsConfig | None = None):
         super().__init__()
         self._config = config or ComCobsConfig()
-        self._queue:  queue.Queue             = queue.Queue()
+        self._queue:  queue.Queue             = queue.Queue(maxsize=512)
         self._port:   serial.Serial | None    = None
         self._thread: threading.Thread | None = None
 
@@ -352,7 +352,8 @@ class ComCobsSource(BaseSource):
             )
         except serial.SerialException as e:
             self._emit_error(f'Не удалось открыть {self._config.port}: {e}')
-            return
+            self._drain_errors()
+            return False
 
         self._running       = True
         self._t_start       = time.perf_counter()
@@ -373,6 +374,7 @@ class ComCobsSource(BaseSource):
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
         self._drain_timer.start(self._DRAIN_MS)
+        return True
 
     def stop(self):
         self._running = False
@@ -521,12 +523,13 @@ class ComCobsSource(BaseSource):
         if self._sample_count % self._RECAL_AT == 0:
             self._calibrate_rate()
 
-        self._queue.put((np.array([t], dtype=np.float64), values))
+        put_drop_oldest(self._queue, (np.array([t], dtype=np.float64), values))
         self._pkt_ok += 1
 
     # ------------------------------------------------------------------
 
     def _drain_queue(self):
+        self._drain_errors()
         while True:
             try:
                 times, values = self._queue.get_nowait()

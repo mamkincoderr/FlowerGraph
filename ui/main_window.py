@@ -16,7 +16,6 @@ MainWindow — главное окно FlowerGraph.
 import os
 import time
 import tempfile
-from datetime import timedelta
 from enum import Enum, auto
 from pathlib import Path
 
@@ -25,13 +24,15 @@ from PySide6.QtWidgets import (
     QMainWindow, QStatusBar, QMenuBar, QToolBar,
     QLabel, QMessageBox, QComboBox, QWidget,
     QHBoxLayout, QVBoxLayout, QSplitter, QPushButton,
-    QListWidget, QListWidgetItem, QFileDialog, QInputDialog
+    QListWidget, QListWidgetItem, QFileDialog, QInputDialog,
+    QSystemTrayIcon, QMenu,
 )
 from PySide6.QtCore import QSize, QTimer, Qt
-from PySide6.QtGui import QAction, QKeySequence, QIcon
+from PySide6.QtGui import QAction, QKeySequence
 
 from core.config import config
-from core.session import Session, Block, ChannelInfo
+from core.app_icon import app_icon
+from core.session import Session, Block, ChannelInfo, Annotation
 from core import file_io
 from core import calib_file
 from ui.export_dialog import ExportCsvDialog, export_csv
@@ -53,7 +54,7 @@ from ui.com_ascii_dialog import ComAsciiDialog
 from core.i18n import tr, set_lang, get_lang
 
 APP_NAME    = 'FlowerGraph'
-APP_VERSION = '0.6.3.2'
+APP_VERSION = '0.7.0'
 FILE_FILTER    = 'FlowerGraph Data (*.fgd);;Все файлы (*)'
 PGC_FILTER     = 'PGC (*.pgc);;Все файлы (*)'
 
@@ -101,6 +102,8 @@ class MainWindow(QMainWindow):
         self._tmp_t_path  = ''
         self._tmp_v_path  = ''
         self._use_streaming = True  # всегда писать на диск (экономия RAM)
+        self._pending_ann: list[tuple[float, str]] = []
+        self._rec_last_t = 0.0
 
         # Источники данных
         self._source_type       = SourceType.GENERATOR
@@ -159,6 +162,7 @@ class MainWindow(QMainWindow):
         self._restore_source_configs()
 
         self._setup_window()
+        self._setup_tray()
         self._build_menu()
         self._build_toolbar()
         self._build_statusbar()
@@ -189,9 +193,42 @@ class MainWindow(QMainWindow):
     def _setup_window(self):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(1000, 680)
-        icon_path = Path(__file__).resolve().parent.parent / 'assets' / 'icon.ico'
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
+        icon = app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
+
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = None
+            return
+        icon = app_icon()
+        self._tray = QSystemTrayIcon(self)
+        if not icon.isNull():
+            self._tray.setIcon(icon)
+        self._tray.setToolTip(APP_NAME)
+        menu = QMenu(self)
+        act_show = QAction('Показать', self)
+        act_show.triggered.connect(self._show_from_tray)
+        act_quit = QAction('Выход', self)
+        act_quit.triggered.connect(self.close)
+        menu.addAction(act_show)
+        menu.addSeparator()
+        menu.addAction(act_quit)
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._show_from_tray()
 
     def _build_central(self):
         # Левая панель: шкала амплитуды
@@ -595,9 +632,16 @@ class MainWindow(QMainWindow):
     def _on_start(self):
         if self._state != AppState.IDLE:
             return
-        self._start_source()
+        if not self._start_source():
+            QMessageBox.warning(
+                self, 'Источник',
+                'Не удалось запустить источник. Проверьте COM-порт.',
+            )
+            return
         self._rec_chunks_t.clear()
         self._rec_chunks_v.clear()
+        self._pending_ann.clear()
+        self._rec_last_t = 0.0
         self._rec_start_wall = time.time()
         self._rec_total_pts  = 0
         self._rec_n_channels = 0
@@ -622,18 +666,33 @@ class MainWindow(QMainWindow):
             self._on_stop()
 
     def _open_tmp_files(self):
-        self._close_tmp_files()
+        self._close_tmp_files(remove=True)
+        fd_t = fd_v = None
         try:
-            tmp_dir = tempfile.gettempdir()
-            self._tmp_t_path = os.path.join(tmp_dir, '_fg_rec_times.bin')
-            self._tmp_v_path = os.path.join(tmp_dir, '_fg_rec_values.bin')
-            self._tmp_t_file = open(self._tmp_t_path, 'wb')
-            self._tmp_v_file = open(self._tmp_v_path, 'wb')
-        except Exception as e:
+            fd_t, self._tmp_t_path = tempfile.mkstemp(prefix='fg_rec_t_', suffix='.bin')
+            fd_v, self._tmp_v_path = tempfile.mkstemp(prefix='fg_rec_v_', suffix='.bin')
+            self._tmp_t_file = open(fd_t, 'wb')
+            self._tmp_v_file = open(fd_v, 'wb')
+        except Exception:
+            if fd_t is not None:
+                try:
+                    os.close(fd_t)
+                except Exception:
+                    pass
+            if fd_v is not None:
+                try:
+                    os.close(fd_v)
+                except Exception:
+                    pass
+            self._close_tmp_files(remove=True)
             self._tmp_t_file = None
             self._tmp_v_file = None
+            QMessageBox.warning(
+                self, 'Запись',
+                'Не удалось открыть временные файлы — запись пойдёт в RAM.',
+            )
 
-    def _close_tmp_files(self):
+    def _close_tmp_files(self, remove: bool = False):
         for f in (self._tmp_t_file, self._tmp_v_file):
             try:
                 if f:
@@ -642,75 +701,72 @@ class MainWindow(QMainWindow):
                 pass
         self._tmp_t_file = None
         self._tmp_v_file = None
+        if remove:
+            for p in (self._tmp_t_path, self._tmp_v_path):
+                if p:
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+            self._tmp_t_path = ''
+            self._tmp_v_path = ''
 
     def _on_stop(self):
         self._autosave_timer.stop()
         self._rec_timer.stop()
-        was_recording  = self._state == AppState.RECORDING
-        was_monitoring = self._state == AppState.MONITORING
+        was_recording = self._state == AppState.RECORDING
 
         if self._source:
             self._source.stop()
-            self._source = None
         self._plot_area.stop()
 
         has_data = (self._rec_total_pts > 0)
         if was_recording and has_data:
             self._finalize_block()
         elif was_recording:
-            self._close_tmp_files()
-        if was_monitoring:
-            # Показать весь кольцевой буфер как статический снимок
-            self._plot_area.freeze_live_view()
+            self._close_tmp_files(remove=True)
 
+        self._source = None
         self._set_state(AppState.IDLE)
         self._lbl_rec_cnt.setText('')
 
-    def _start_source(self):
+    def _start_source(self) -> bool:
         st = self._source_type
         if st == SourceType.COM_ASCII:
             src = ComAsciiSource(self._com_config)
             cfg_n_ch = self._com_config.n_channels
-            cfg_baud = self._com_config.baudrate
         elif st == SourceType.COM_COBS:
             src = ComCobsSource(self._cobs_config)
             cfg_n_ch = self._cobs_config.n_channels
-            cfg_baud = self._cobs_config.baudrate
         elif st == SourceType.COM_MCOBS:
             src = ComMCobsSource(self._mcobs_config)
             cfg_n_ch = self._mcobs_config.n_channels
-            cfg_baud = self._mcobs_config.baudrate
         else:
             src = VirtualGenerator(self._gen_config)
-            cfg_n_ch = -1   # всегда известно
-            cfg_baud = 0
+            cfg_n_ch = -1
 
         src.set_data_callback(self._on_data)
         src.set_error_callback(self._on_source_error)
 
+        ok = src.start()
+        src._drain_errors()
+        if not ok or not src.is_running:
+            return False
+
         is_com = st in (SourceType.COM_ASCII, SourceType.COM_COBS, SourceType.COM_MCOBS)
-        if is_com:
-            if cfg_n_ch == 0:
-                # Авто-определение числа каналов по первому пакету
-                self._source = src
-                self._source.start()
-                self._source_ready = False
-                self._lbl_source.setText(f'Источник: {src.get_name()} — ожидание…')
-            else:
-                n_ch = cfg_n_ch
-                bytes_per_pkt = n_ch * 8 + 1
-                sr = int(cfg_baud / (bytes_per_pkt * 10))
-                self._setup_source_ui(src, sr)
-                self._source = src
-                self._source.start()
-                self._source_ready = True
-                self._lbl_source.setText(f'Источник: {src.get_name()}')
+        self._source = src
+        if is_com and cfg_n_ch == 0:
+            self._source_ready = False
+            self._lbl_source.setText(f'Источник: {src.get_name()} — ожидание…')
         else:
-            self._setup_source_ui(src, self._gen_config.sample_rate)
-            self._source = src
-            self._source.start()
+            if hasattr(src, 'effective_sample_rate'):
+                sr = src.effective_sample_rate()
+            else:
+                sr = self._gen_config.sample_rate
+            self._setup_source_ui(src, sr)
             self._source_ready = True
             self._lbl_source.setText(f'Источник: {src.get_name()}')
+        return True
 
     def _set_state(self, state: AppState):
         self._state = state
@@ -722,6 +778,8 @@ class MainWindow(QMainWindow):
         self._act_stop.setEnabled(active)
         self._tb_stop.setEnabled(active)
         self._nav_bar.set_recording(active)
+        if hasattr(self, '_cb_source'):
+            self._cb_source.setEnabled(idle)
 
         if idle:
             self._lbl_mode.setText('')
@@ -763,14 +821,13 @@ class MainWindow(QMainWindow):
             if not self._rec_n_channels:
                 self._rec_n_channels = values.shape[1]
             if self._tmp_t_file is not None and self._tmp_v_file is not None:
-                # Потоковая запись на диск
                 times.astype(np.float64).tofile(self._tmp_t_file)
                 values.astype(np.float32).tofile(self._tmp_v_file)
             else:
-                # Запасной вариант: в RAM
                 self._rec_chunks_t.append(times.copy())
                 self._rec_chunks_v.append(values.copy())
             self._rec_total_pts += len(times)
+            self._rec_last_t = float(times[-1])
 
     def _on_source_error(self, msg: str):
         # Сообщения авто-реконнекта — в строку состояния, не как «ошибку»
@@ -814,7 +871,17 @@ class MainWindow(QMainWindow):
         n_ch  = values_all.shape[1]
         names = (self._source.get_channel_names()
                  if self._source else [f'CH{i+1}' for i in range(n_ch)])
-        ch_info = [ChannelInfo(name=n) for n in names[:n_ch]]
+        ch_info = []
+        for i, n in enumerate(names[:n_ch]):
+            scale, offset = (1.0, 0.0)
+            try:
+                scale, offset = self._plot_area.get_channel_calib(i)
+            except Exception:
+                pass
+            ch_info.append(ChannelInfo(name=n, scale=scale, offset=offset))
+
+        anns = [Annotation(t=t, text=text) for t, text in self._pending_ann]
+        self._pending_ann.clear()
 
         block = Block(
             start_time  = self._rec_start_wall,
@@ -823,6 +890,7 @@ class MainWindow(QMainWindow):
             channels    = ch_info,
             times       = times_all,
             values      = values_all,
+            annotations = anns,
         )
         self._session.add_block(block)
         self._current_block_idx = self._session.n_blocks - 1
@@ -834,7 +902,15 @@ class MainWindow(QMainWindow):
 
 
     def _autosave(self):
-        if self._session.file_path and self._state == AppState.RECORDING:
+        if self._state == AppState.RECORDING:
+            for f in (self._tmp_t_file, self._tmp_v_file):
+                try:
+                    if f:
+                        f.flush()
+                except Exception:
+                    pass
+            return
+        if self._session.file_path:
             try:
                 file_io.save(self._session, self._session.file_path)
             except Exception:
@@ -878,25 +954,27 @@ class MainWindow(QMainWindow):
         self._current_block_idx = idx
         self._display_block(idx)
 
-    def _on_save(self):
+    def _on_save(self) -> bool:
         if self._session.file_path:
-            self._do_save(self._session.file_path)
-        else:
-            self._on_save_as()
+            return self._do_save(self._session.file_path)
+        return self._on_save_as()
 
-    def _on_save_as(self):
+    def _on_save_as(self) -> bool:
         path, _ = QFileDialog.getSaveFileName(self, 'Сохранить файл', '', FILE_FILTER)
-        if path:
-            self._do_save(path)
+        if not path:
+            return False
+        return self._do_save(path)
 
-    def _do_save(self, path: str):
+    def _do_save(self, path: str) -> bool:
         try:
             file_io.save(self._session, path)
             config.add_recent_file(self._session.file_path)
             self._update_recent_menu()
             self._update_title()
+            return True
         except Exception as e:
             QMessageBox.critical(self, 'Ошибка сохранения', str(e))
+            return False
 
     # ==================================================================
     # Навигация по блокам
@@ -919,8 +997,6 @@ class MainWindow(QMainWindow):
             self._channel_panel.update_unit(i, u)
         self._refresh_block_list()
         self._update_session_overview()
-        # Попытаться загрузить .cal файл если есть
-        self._load_calibration_file()
 
     # ==================================================================
     # Сессионный обзор: все блоки в NavBar
@@ -1091,14 +1167,11 @@ class MainWindow(QMainWindow):
     # ==================================================================
 
     def _on_add_annotation(self):
-        if self._state != AppState.RECORDING or not self._rec_chunks_t:
+        if self._state != AppState.RECORDING or self._rec_total_pts <= 0:
             return
         text, ok = QInputDialog.getText(self, 'Метка', 'Текст метки:')
         if ok and text:
-            if not hasattr(self, '_pending_ann'):
-                self._pending_ann = []
-            t = float(self._rec_chunks_t[-1][-1])
-            self._pending_ann.append((t, text))
+            self._pending_ann.append((self._rec_last_t, text))
 
     # ==================================================================
     # Маркеры
@@ -1284,7 +1357,8 @@ class MainWindow(QMainWindow):
             if r == QMessageBox.Cancel:
                 return
             if r == QMessageBox.Yes:
-                self._on_save()
+                if not self._on_save():
+                    return
 
         # Сброс всего
         self._session           = Session()
@@ -1389,6 +1463,8 @@ class MainWindow(QMainWindow):
             self._configure_com_mcobs()
 
     def _configure_generator(self):
+        if self._state != AppState.IDLE:
+            return
         dlg = VirtualGeneratorDialog(self._gen_config, parent=self)
         if dlg.exec():
             self._gen_config = dlg.get_config()
@@ -1405,16 +1481,22 @@ class MainWindow(QMainWindow):
                 self._nav_bar.setup_channels(self._gen_config.n_channels, colors)
 
     def _configure_com_ascii(self):
+        if self._state != AppState.IDLE:
+            return
         dlg = ComAsciiDialog(self._com_config, parent=self)
         if dlg.exec():
             self._com_config = dlg.get_config()
 
     def _configure_com_cobs(self):
+        if self._state != AppState.IDLE:
+            return
         dlg = ComCobsDialog(self._cobs_config, parent=self)
         if dlg.exec():
             self._cobs_config = dlg.get_cobs_config()
 
     def _configure_com_mcobs(self):
+        if self._state != AppState.IDLE:
+            return
         dlg = ComMCobsDialog(self._mcobs_config, parent=self)
         if dlg.exec():
             self._mcobs_config = dlg.get_mcobs_config()
@@ -1442,10 +1524,8 @@ class MainWindow(QMainWindow):
         if self._state != AppState.RECORDING:
             return
         elapsed = int(time.time() - self._rec_start_wall)
-        td  = timedelta(seconds=elapsed)
-        h   = td.seconds // 3600
-        m   = (td.seconds % 3600) // 60
-        s   = td.seconds % 60
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
 
         # Оценка занятого пространства (потоковая запись → диск)
         n_ch = self._rec_n_channels or 0
@@ -1544,7 +1624,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, 'Выделение',
                                     'В выделении недостаточно данных.')
             return
-        ch_info   = [ChannelInfo(name=ch.name) for ch in block.channels]
+        ch_info   = [
+            ChannelInfo(name=ch.name, unit=ch.unit, scale=ch.scale, offset=ch.offset)
+            for ch in block.channels
+        ]
         new_block = Block(
             start_time  = block.start_time,
             source_name = block.source_name + ' [выделение]',
@@ -1853,7 +1936,9 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             if r == QMessageBox.Yes:
-                self._on_save()
+                if not self._on_save():
+                    event.ignore()
+                    return
         geo = self.geometry()
         config.set('window', 'x',         value=geo.x())
         config.set('window', 'y',         value=geo.y())
@@ -1868,6 +1953,8 @@ class MainWindow(QMainWindow):
         config.set('source_mcobs',     value=self._mcobs_config.to_dict())
         config.set('source_generator', value=self._gen_config.to_dict())
         config.save()
+        if getattr(self, '_tray', None) is not None:
+            self._tray.hide()
         super().closeEvent(event)
 
 
