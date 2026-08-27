@@ -36,6 +36,17 @@ TIME_DIV_SEQ: list[float] = [
 N_DIV        = 10    # делений по горизонтали
 DEFAULT_IDX  = 12    # 10 мс/дел → окно 100 мс
 
+
+def time_div_idx_for_span(span: float) -> int:
+    """Ближайший 1-2-5, при котором окно (N_DIV делений) покрывает span."""
+    if span <= 0:
+        return DEFAULT_IDX
+    needed = span / N_DIV
+    for i, t in enumerate(TIME_DIV_SEQ):
+        if t >= needed:
+            return i
+    return len(TIME_DIV_SEQ) - 1
+
 # Дискретный ряд цен деления по Y (единицы данных / деление)
 Y_DIV_SEQ: list[float] = [
     1000.0, 500.0, 200.0, 100.0, 50.0, 20.0, 10.0,
@@ -329,13 +340,12 @@ class PlotArea(QWidget):
     # Загрузка блока
     # ------------------------------------------------------------------
 
-    def load_block(self, block: Block):
+    def load_block(self, block: Block, *, fit: bool = True):
         names = [ch.name for ch in block.channels]
         self.setup(n_channels=block.n_channels,
                    names=names,
                    sample_rate=block.sample_rate)
 
-        # Восстановить физическую калибровку из метаданных блока
         for i, ch in enumerate(block.channels):
             if i < len(self._calib_coeff):
                 self._calib_coeff[i]  = ch.scale
@@ -344,16 +354,15 @@ class PlotArea(QWidget):
         self._static_times  = block.times.astype(np.float64)
         self._static_values = block.values.astype(np.float32)
         self._static_mode   = True
-        self._static_dirty  = True   # первый рендер после загрузки
+        self._static_dirty  = True
         self._following     = False
         self.following_changed.emit(False)
 
         t0, t1 = float(block.t_start), float(block.t_end)
-        # Жёстко ограничить навигацию пределами записи
         self._plot.plotItem.getViewBox().setLimits(xMin=t0, xMax=t1)
-        self._plot.setXRange(t0, t1, padding=0.02)
         self._plot.enableAutoRange(axis='y', enable=True)
-        # Сразу сгенерировать обзорные данные
+        if fit:
+            self.fit_to_span(t0, t1, anchor='start')
         self._emit_overview()
 
     # ------------------------------------------------------------------
@@ -377,6 +386,25 @@ class PlotArea(QWidget):
     def set_time_div_idx(self, idx: int):
         self._time_div_idx = max(0, min(idx, len(TIME_DIV_SEQ) - 1))
         self._apply_time_div()
+
+    def fit_to_span(self, t0: float, t1: float, anchor: str = 'start'):
+        """Подобрать 1-2-5 так, чтобы span влез в окно, и выставить вид."""
+        self._time_div_idx = time_div_idx_for_span(max(0.0, t1 - t0))
+        t_div = TIME_DIV_SEQ[self._time_div_idx]
+        try:
+            self._plot.getAxis('bottom').setTickSpacing(major=t_div, minor=t_div / 5)
+        except Exception:
+            pass
+        w = t_div * N_DIV
+        self._static_dirty = True
+        if anchor == 'end':
+            self._set_x_range(t1 - w, t1)
+        elif anchor == 'center':
+            c = (t0 + t1) / 2.0
+            self._set_x_range(c - w / 2.0, c + w / 2.0)
+        else:
+            self._set_x_range(t0, t0 + w)
+        self.time_div_changed.emit(self._time_div_idx)
 
     def _apply_time_div(self):
         t_div  = TIME_DIV_SEQ[self._time_div_idx]
@@ -641,10 +669,9 @@ class PlotArea(QWidget):
         self._following     = False
         self.following_changed.emit(False)
         t0, t1 = float(times[0]), float(times[-1])
-        # Ограничить навигацию пределами буфера
         self._plot.plotItem.getViewBox().setLimits(xMin=t0, xMax=t1)
-        self._plot.setXRange(t0, t1, padding=0.02)
         self._plot.enableAutoRange(axis='y', enable=True)
+        self.fit_to_span(t0, t1, anchor='end')
         self._emit_overview()
         if not self._timer.isActive():
             self._timer.start()
@@ -923,10 +950,7 @@ class PlotArea(QWidget):
                 r = _p._selection_item.getRegion()
                 t0, t1 = float(r[0]), float(r[1])
                 if t1 > t0 + 1e-9:
-                    _p._suppress_range_signal = True
-                    _p._plot.setXRange(t0, t1, padding=0.02)
-                    _p._suppress_range_signal = False
-                    _p._static_dirty = True
+                    _p.fit_to_span(t0, t1, anchor='start')
                     ev.accept()
                     return
             pg.ViewBox.mouseDoubleClickEvent(vb_self, ev)

@@ -54,7 +54,7 @@ from ui.com_ascii_dialog import ComAsciiDialog
 from core.i18n import tr, set_lang, get_lang
 
 APP_NAME    = 'FlowerGraph'
-APP_VERSION = '0.7.0'
+APP_VERSION = '0.7.1'
 FILE_FILTER    = 'FlowerGraph Data (*.fgd);;Все файлы (*)'
 PGC_FILTER     = 'PGC (*.pgc);;Все файлы (*)'
 
@@ -980,14 +980,14 @@ class MainWindow(QMainWindow):
     # Навигация по блокам
     # ==================================================================
 
-    def _display_block(self, idx: int):
+    def _display_block(self, idx: int, *, fit: bool = True):
         if not (0 <= idx < self._session.n_blocks):
             return
         block = self._session.blocks[idx]
         self._current_block_idx = idx
         names  = [ch.name for ch in block.channels]
         units  = [ch.unit for ch in block.channels]
-        self._plot_area.load_block(block)
+        self._plot_area.load_block(block, fit=fit)
         colors = self._plot_area.get_channel_colors()
         self._channel_panel.setup(names, colors)
         self._amp_scale.setup(names, colors)
@@ -1085,7 +1085,7 @@ class MainWindow(QMainWindow):
             )
 
     def _on_nav_navigate(self, global_t0: float, global_t1: float):
-        """Навигация из NavBar (глобальные координаты) → PlotArea (локальные)."""
+        """Навигация из NavBar: блок выбирается по центру окна, масштаб не сбрасывается."""
         if self._state in (AppState.MONITORING, AppState.RECORDING):
             self._plot_area.set_view_range(global_t0, global_t1)
             return
@@ -1093,18 +1093,17 @@ class MainWindow(QMainWindow):
             self._plot_area.set_view_range(global_t0, global_t1)
             return
 
-        # Определить целевой блок по глобальной позиции
         blocks  = self._session.blocks
         offsets = self._block_global_offsets
+        center  = (global_t0 + global_t1) / 2.0
         target  = len(offsets) - 1
         for i in range(len(offsets) - 1):
-            if global_t0 < offsets[i + 1]:
+            if center < offsets[i + 1]:
                 target = i
                 break
 
-        # Переключить блок если нужно
         if target != self._current_block_idx:
-            self._display_block(target)
+            self._display_block(target, fit=False)
 
         offset        = offsets[target]
         t_start_local = float(blocks[target].t_start)
@@ -1121,19 +1120,11 @@ class MainWindow(QMainWindow):
         self._plot_area.set_view_range(b.t_start, b.t_start + w)
 
     def _on_show_block(self):
-        """Показать весь активный блок, подобрав масштаб."""
+        """Показать весь активный блок: 1-2-5 совпадает с окном."""
         if not (0 <= self._current_block_idx < self._session.n_blocks):
             return
-        b  = self._session.blocks[self._current_block_idx]
-        # Выбрать масштаб чтобы блок влез
-        needed = b.duration / N_DIV
-        idx = 0
-        for i, t in enumerate(TIME_DIV_SEQ):
-            if t >= needed:
-                idx = i
-                break
-        self._plot_area.set_time_div_idx(idx)
-        self._plot_area.set_view_range(b.t_start, b.t_end)
+        b = self._session.blocks[self._current_block_idx]
+        self._plot_area.fit_to_span(b.t_start, b.t_end, anchor='start')
 
     def _on_prev_block(self):
         if self._current_block_idx > 0:
