@@ -151,7 +151,7 @@ assets/          сплэш, иконка
 
 <div align="center">
 
-**FlowerGraph** v0.6.3.2 · ELEKS
+**FlowerGraph** v0.6.3.2
 
 [Исходники](https://github.com/mamkincoderr/FlowerGraph)
 ·

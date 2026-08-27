@@ -462,4 +462,4 @@ API: cobs_encode(src, src_len, dst, dst_max, &dst_len)
 
 ---
 
-*FlowerGraph v0.6.3.1 · ELEKS · Май 2026*
+*FlowerGraph v0.6.3.1 · Май 2026*
