@@ -1057,21 +1057,16 @@ class PlotArea(QWidget):
             n = min(n, MAX_RING_SAMPLES)  # колесо не может вызвать копирование > ёмкости буфера
             return self._buffer.get_last(n)
         else:
-            # Non-following LIVE: используем get_last для размера текущего окна.
-            # buffer.get() (полная копия буфера) здесь нельзя — слишком дорого.
-            vr       = self._plot.plotItem.getViewBox().viewRange()[0]
-            t_lo     = float(vr[0])
-            t_hi     = float(vr[1])
-            n_window = max(2, int((t_hi - t_lo) * self._sample_rate) + 2)
-            n_window = min(n_window, MAX_RING_SAMPLES)  # не больше ёмкости буфера
-            t, v = self._buffer.get_last(n_window)
+            vr   = self._plot.plotItem.getViewBox().viewRange()[0]
+            t_lo = float(vr[0])
+            t_hi = float(vr[1])
+            t, v = self._buffer.get_last(self._buffer.size)
             if len(t) < 2:
                 return None, None
-            # Срезаем до видимого окна (get_last отдаёт самые свежие данные)
             i0 = max(0, int(np.searchsorted(t, t_lo)) - 1)
             i1 = min(len(t), int(np.searchsorted(t, t_hi)) + 2)
             if i0 >= i1:
-                return t, v   # показываем всё что есть
+                return None, None
             return t[i0:i1], v[i0:i1]
 
     # ------------------------------------------------------------------

@@ -11,7 +11,7 @@ Live-осциллограф, блоки, калибровка — без MATLAB.
 
 <br>
 
-<img src="https://img.shields.io/badge/version-0.6.3.2-7F2F3F?style=for-the-badge">
+<img src="https://img.shields.io/badge/version-0.7.0-7F2F3F?style=for-the-badge">
 <img src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-4A3A2E?style=for-the-badge">
 <img src="https://img.shields.io/badge/Python-3.11-637043?style=for-the-badge">
 <img src="https://img.shields.io/badge/.pgc-.fgd-.csv-B24A5E?style=for-the-badge">
@@ -151,7 +151,7 @@ assets/          сплэш, иконка
 
 <div align="center">
 
-**FlowerGraph** v0.6.3.2
+**FlowerGraph** v0.7.0
 
 [Исходники](https://github.com/mamkincoderr/FlowerGraph)
 ·

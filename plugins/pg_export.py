@@ -35,6 +35,25 @@ def save(block: Block, path: str | Path) -> None:
     sr        = float(block.sample_rate)
     src_name  = block.source_name[:63].encode('ascii', errors='replace')
 
+    int16_cols = []
+    adc_scales = []
+    for c in range(n_ch):
+        col = block.values[:, c].astype(np.float64)
+        peak = float(np.max(np.abs(col))) if col.size else 0.0
+        if peak < 1e-12:
+            adc_scales.append(1.0)
+            int16_cols.append(np.zeros(n_samples, dtype=np.int16))
+        else:
+            scale = peak / 32767.0
+            adc_scales.append(scale)
+            int16_cols.append(
+                np.clip(np.round(col / scale), -32767, 32767).astype(np.int16)
+            )
+    int16_data = (
+        np.column_stack(int16_cols) if n_ch
+        else np.zeros((n_samples, 0), dtype=np.int16)
+    )
+
     buf = bytearray()
 
     # -------------------------------------------------------------------------
@@ -72,9 +91,9 @@ def save(block: Block, path: str | Path) -> None:
     # -------------------------------------------------------------------------
     raw_ranges = []
     for c in range(min(n_ch, _N_SLOTS)):
-        col = block.values[:, c]
-        raw_min = int(np.clip(float(np.min(col)), -32767, 32767))
-        raw_max = int(np.clip(float(np.max(col)), -32767, 32767))
+        col = int16_data[:, c]
+        raw_min = int(np.min(col)) if col.size else 0
+        raw_max = int(np.max(col)) if col.size else 0
         raw_ranges.append((raw_min, raw_max))
 
     for slot in range(_N_SLOTS):
@@ -104,9 +123,8 @@ def save(block: Block, path: str | Path) -> None:
         struct.pack_into('<i', ab, 8, 6)              # mode = COM-ASCII
         struct.pack_into('<i', ab, 12, 0)
         if slot < n_ch:
-            ch = block.channels[slot]
-            A  = float(ch.scale)  if ch.scale  else 1.0
-            B  = float(ch.offset) if ch.offset else 0.0
+            A = float(adc_scales[slot])
+            B = 0.0
             struct.pack_into('<f', ab, 16, A)
             struct.pack_into('<f', ab, 20, B)
         else:
@@ -147,7 +165,7 @@ def save(block: Block, path: str | Path) -> None:
     # -------------------------------------------------------------------------
     # data: int16 interleaved (только активные каналы = 0..n_ch-1)
     # -------------------------------------------------------------------------
-    data_bytes = block.values[:, :n_ch].astype('<i2').tobytes()
+    data_bytes = int16_data.astype('<i2', copy=False).tobytes()
     data_hdr = bytearray(8)
     struct.pack_into('4s', data_hdr, 0, b'data')
     struct.pack_into('<I', data_hdr, 4, len(data_bytes))

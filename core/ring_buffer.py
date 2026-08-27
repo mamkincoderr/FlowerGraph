@@ -73,7 +73,8 @@ class RingBuffer:
 
     @property
     def size(self) -> int:
-        return self._size
+        with self._lock:
+            return self._size
 
     @property
     def n_channels(self) -> int:

@@ -1,4 +1,6 @@
 import sys
+import os
+import atexit
 import logging
 import traceback
 from pathlib import Path
@@ -28,29 +30,47 @@ else:
     _BASE_DIR = Path(__file__).parent
 
 _SPLASH_FILE = _BASE_DIR / 'assets' / 'Splash.png'
-_LOG_FILE    = Path(__file__).parent / 'flowergraph.log'
 
 
-# ---------------------------------------------------------------------------
-# Tee: дублирует stdout/stderr в лог-файл
-# ---------------------------------------------------------------------------
+def _log_path() -> Path:
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent / 'flowergraph.log'
+    return Path(__file__).parent / 'flowergraph.log'
+
+
+class _NullStream:
+    def write(self, data: str):
+        return 0
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
 
 class _Tee:
-    """Перехватчик потока: пишет в оригинальный поток И в файл."""
+    """Пишет в оригинальный поток (если есть) и в общий лог-файл."""
 
-    def __init__(self, original, log_path: Path):
-        self._orig = original
-        self._file = open(log_path, 'a', encoding='utf-8', buffering=1)
+    def __init__(self, original, log_file):
+        self._orig = original if original is not None else _NullStream()
+        self._file = log_file
 
     def write(self, data: str):
-        self._orig.write(data)
+        try:
+            self._orig.write(data)
+        except Exception:
+            pass
         try:
             self._file.write(data)
         except Exception:
             pass
 
     def flush(self):
-        self._orig.flush()
+        try:
+            self._orig.flush()
+        except Exception:
+            pass
         try:
             self._file.flush()
         except Exception:
@@ -64,32 +84,30 @@ _LOG_MAX_LINES = 2000   # максимум строк в лог-файле ме�
 
 
 def _setup_logging():
-    """Перенаправить stdout/stderr в flowergraph.log + консоль."""
     from datetime import datetime
 
-    # Обрезать лог до _LOG_MAX_LINES строк (чтобы не рос бесконечно)
-    if _LOG_FILE.exists():
+    log_file_path = _log_path()
+    if log_file_path.exists():
         try:
-            lines = _LOG_FILE.read_text(encoding='utf-8', errors='replace').splitlines()
+            lines = log_file_path.read_text(encoding='utf-8', errors='replace').splitlines()
             if len(lines) > _LOG_MAX_LINES:
-                _LOG_FILE.write_text(
+                log_file_path.write_text(
                     '\n'.join(lines[-_LOG_MAX_LINES:]) + '\n',
                     encoding='utf-8',
                 )
         except Exception:
             pass
 
-    # Записать разделитель сессии
+    log_fh = open(log_file_path, 'a', encoding='utf-8', buffering=1)
+    atexit.register(log_fh.close)
     sep = '=' * 72
-    with open(_LOG_FILE, 'a', encoding='utf-8') as f:
-        f.write(f'\n{sep}\n')
-        f.write(f'  FlowerGraph  {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
-        f.write(f'{sep}\n')
+    log_fh.write(f'\n{sep}\n')
+    log_fh.write(f'  FlowerGraph  {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
+    log_fh.write(f'{sep}\n')
 
-    sys.stdout = _Tee(sys.stdout, _LOG_FILE)
-    sys.stderr = _Tee(sys.stderr, _LOG_FILE)
+    sys.stdout = _Tee(sys.stdout, log_fh)
+    sys.stderr = _Tee(sys.stderr, log_fh)
 
-    # Глобальный перехватчик необработанных исключений
     def _exc_hook(exc_type, exc_value, exc_tb):
         msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
         sys.stderr.write(f'[UNHANDLED EXCEPTION]\n{msg}')
@@ -97,12 +115,10 @@ def _setup_logging():
 
     sys.excepthook = _exc_hook
 
-    # Направить стандартный logging тоже в файл
     logging.basicConfig(
-        filename=str(_LOG_FILE),
+        stream=log_fh,
         level=logging.WARNING,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        encoding='utf-8',
     )
 
 

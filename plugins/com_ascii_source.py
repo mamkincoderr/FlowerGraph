@@ -24,7 +24,7 @@ import serial
 import serial.tools.list_ports
 from PySide6.QtCore import QTimer
 
-from plugins.base_source import BaseSource
+from plugins.base_source import BaseSource, put_drop_oldest
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ class ComAsciiSource(BaseSource):
     def __init__(self, config: ComAsciiConfig | None = None):
         super().__init__()
         self._config      = config or ComAsciiConfig()
-        self._queue: queue.Queue = queue.Queue()
+        self._queue: queue.Queue = queue.Queue(maxsize=512)
         self._port: serial.Serial | None = None
         self._thread: threading.Thread | None = None
 
@@ -117,7 +117,8 @@ class ComAsciiSource(BaseSource):
             )
         except serial.SerialException as e:
             self._emit_error(f'Не удалось открыть {self._config.port}: {e}')
-            return
+            self._drain_errors()
+            return False
 
         self._running       = True
         self._t_start       = time.perf_counter()
@@ -137,6 +138,7 @@ class ComAsciiSource(BaseSource):
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
         self._drain_timer.start(self._DRAIN_MS)
+        return True
 
     def stop(self):
         self._running = False
@@ -303,7 +305,7 @@ class ComAsciiSource(BaseSource):
             self._calibrate_rate()
 
         times = np.array([t], dtype=np.float64)
-        self._queue.put((times, values))
+        put_drop_oldest(self._queue, (times, values))
         self._pkt_ok += 1
 
     # ------------------------------------------------------------------
@@ -311,6 +313,7 @@ class ComAsciiSource(BaseSource):
     # ------------------------------------------------------------------
 
     def _drain_queue(self):
+        self._drain_errors()
         while True:
             try:
                 times, values = self._queue.get_nowait()
