@@ -3,7 +3,7 @@
 
 #define AppName      "FlowerGraph"
 #define AppVersion   "0.6.3.2"
-#define AppPublisher "ELEKS"
+#define AppPublisher "FlowerGraph"
 #define AppURL       ""
 #define AppExeName   "FlowerGraph.exe"
 #define DistDir      "..\dist\FlowerGraph"
