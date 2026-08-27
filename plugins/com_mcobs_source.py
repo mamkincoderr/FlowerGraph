@@ -26,8 +26,9 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QFormLayout, QSpinBox, QHBoxLayout, QLabel
 
 from plugins.base_source import BaseSource, put_drop_oldest
+from plugins.cobs_codec import _crc16, _cobs_decode
 from plugins.com_cobs_source import (
-    ComCobsConfig, ComCobsDialog, _crc16, _cobs_decode,
+    ComCobsConfig, ComCobsDialog,
     DATA_FORMATS, _FMT_LABELS, _FMT_SHORT, _STRUCT_FMT, _bps,
 )
 from plugins.com_ascii_source import ComAsciiConfig

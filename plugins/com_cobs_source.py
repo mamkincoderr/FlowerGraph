@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from plugins.base_source import BaseSource, put_drop_oldest
+from plugins.cobs_codec import _crc16, _cobs_decode
 from ui.com_ascii_dialog import ComAsciiDialog
 from plugins.com_ascii_source import ComAsciiConfig
 
@@ -67,40 +68,6 @@ def _bps(fmt: str) -> int:
 # ---------------------------------------------------------------------------
 # CRC-16/CCITT (poly 0x1021, init 0xFFFF)
 # ---------------------------------------------------------------------------
-
-def _crc16(data: bytes | bytearray) -> int:
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
-        crc &= 0xFFFF
-    return crc
-
-
-# ---------------------------------------------------------------------------
-# COBS decode
-# ---------------------------------------------------------------------------
-
-def _cobs_decode(data: bytes) -> bytes | None:
-    """COBS-декодирование блока без финального 0x00."""
-    result = bytearray()
-    idx = 0
-    n   = len(data)
-    while idx < n:
-        code = data[idx]
-        if code == 0:
-            return None
-        idx += 1
-        end  = idx + code - 1
-        if end > n:
-            return None
-        result.extend(data[idx:end])
-        idx = end
-        if code != 0xFF and idx < n:
-            result.append(0x00)
-    return bytes(result)
-
 
 # ---------------------------------------------------------------------------
 # Конфигурация

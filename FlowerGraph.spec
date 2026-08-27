@@ -37,6 +37,7 @@ a = Analysis(
         'ui.stats_panel',
         'core.calib_file',
         'plugins.base_source',
+        'plugins.cobs_codec',
         'plugins.virtual_generator',
         'plugins.com_ascii_source',
         'plugins.com_cobs_source',
