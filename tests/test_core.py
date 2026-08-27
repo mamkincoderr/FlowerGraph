@@ -8,7 +8,7 @@ import numpy as np
 from core.ring_buffer import RingBuffer
 from core.session import Session, Block, ChannelInfo
 from core import file_io
-from plugins.com_cobs_source import _cobs_decode, _crc16
+from plugins.cobs_codec import cobs_decode, crc16
 
 
 class RingBufferTests(unittest.TestCase):
@@ -59,11 +59,11 @@ class CobsTests(unittest.TestCase):
     def test_decode_simple(self):
         # COBS of [0x11, 0x00, 0x22] without trailing 0 delimiter
         encoded = bytes([0x02, 0x11, 0x02, 0x22])
-        self.assertEqual(_cobs_decode(encoded), bytes([0x11, 0x00, 0x22]))
+        self.assertEqual(cobs_decode(encoded), bytes([0x11, 0x00, 0x22]))
 
     def test_crc16_stable(self):
-        self.assertEqual(_crc16(b''), 0xFFFF)
-        self.assertIsInstance(_crc16(b'\x01\x02'), int)
+        self.assertEqual(crc16(b''), 0xFFFF)
+        self.assertIsInstance(crc16(b'\x01\x02'), int)
 
 
 class PgcScaleTests(unittest.TestCase):
