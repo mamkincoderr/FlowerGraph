@@ -43,7 +43,10 @@ class NavBar(QWidget):
             values=[0, 1],
             brush=pg.mkBrush(0, 100, 200, 45),
             pen=pg.mkPen('#0064c8', width=1),
+            swapMode='block',
         )
+        for ln in self._region.lines:
+            ln.setMovable(False)
         self._region.sigRegionChanged.connect(self._on_region_changed)
 
         self._build_ui()
@@ -72,7 +75,7 @@ class NavBar(QWidget):
         self._btn_start = self._nav_btn('|◀', 'В начало (Home)',              self.go_start)
         self._btn_left  = self._nav_btn('◀',  'Предыдущая страница (PgUp)',   self.page_left)
         self._btn_right = self._nav_btn('▶',  'Следующая страница (PgDn)',    self.page_right)
-        self._btn_end   = self._nav_btn('▶|', 'В конец / следить (End)',      self.go_end)
+        self._btn_end   = self._nav_btn('▶|', 'В конец блока (End)',          self.go_end)
 
         row1.addWidget(self._btn_start)
         row1.addWidget(self._btn_left)
@@ -93,6 +96,9 @@ class NavBar(QWidget):
         self._ov.setMouseEnabled(x=False, y=False)
         self._ov.plotItem.getViewBox().setBorder(pg.mkPen('#b0b0b0', width=1))
         self._ov.addItem(self._region)
+        scene = self._ov.scene()
+        if scene is not None:
+            scene.sigMouseClicked.connect(self._on_ov_clicked)
         outer.addWidget(self._ov, stretch=1)
 
         # --- Масштаб ---
@@ -102,9 +108,9 @@ class NavBar(QWidget):
         sv.setContentsMargins(0, 0, 0, 0)
         sv.setSpacing(2)
 
-        btn_zi = QPushButton('─')
+        btn_zi = QPushButton('+')
         btn_zi.setFixedHeight(20)
-        btn_zi.setToolTip('Приблизить (уменьшить время/дел)')
+        btn_zi.setToolTip('Приблизить (колесо вверх)')
         btn_zi.clicked.connect(self.zoom_in)
         sv.addWidget(btn_zi)
 
@@ -117,9 +123,9 @@ class NavBar(QWidget):
         )
         sv.addWidget(self._lbl)
 
-        btn_zo = QPushButton('+')
+        btn_zo = QPushButton('−')
         btn_zo.setFixedHeight(20)
-        btn_zo.setToolTip('Отдалить (увеличить время/дел)')
+        btn_zo.setToolTip('Отдалить (колесо вниз)')
         btn_zo.clicked.connect(self.zoom_out)
         sv.addWidget(btn_zo)
 
@@ -150,7 +156,11 @@ class NavBar(QWidget):
     # ------------------------------------------------------------------
 
     def set_recording(self, active: bool):
-        """Переключить вид кнопки Старт/Стоп."""
+        """Переключить вид кнопки Старт/Стоп и смысл ▶|."""
+        if active:
+            self._btn_end.setToolTip('К концу записи и следить (End)')
+        else:
+            self._btn_end.setToolTip('В конец блока (End)')
         if active:
             self._btn_startstop.setText('■  СТОП')
             self._btn_startstop.setStyleSheet(
@@ -178,6 +188,8 @@ class NavBar(QWidget):
             c = self._ov.plot(pen=pg.mkPen(color=color, width=1))
             self._ov_curves.append(c)
         self._ov.addItem(self._region)
+        for ln in self._region.lines:
+            ln.setMovable(False)
 
     def update_overview(self, times: np.ndarray, values: np.ndarray):
         """Обновить кривые обзора (данные уже прорежены до MAX_OVERVIEW_PTS)."""
@@ -218,3 +230,18 @@ class NavBar(QWidget):
     def _on_region_changed(self):
         r = self._region.getRegion()
         self.navigate_to.emit(float(r[0]), float(r[1]))
+
+    def _on_ov_clicked(self, ev):
+        if ev.button() != Qt.MouseButton.LeftButton or ev.double():
+            return
+        vb = self._ov.plotItem.getViewBox()
+        if not vb.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        t = float(vb.mapSceneToView(ev.scenePos()).x())
+        r0, r1 = self._region.getRegion()
+        if r0 <= t <= r1:
+            return
+        w = r1 - r0
+        if w <= 0:
+            return
+        self.navigate_to.emit(t - w / 2.0, t + w / 2.0)

@@ -2,7 +2,7 @@
 ; Компилируется: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" flowergraph_setup.iss
 
 #define AppName      "FlowerGraph"
-#define AppVersion   "0.7.0"
+#define AppVersion   "0.7.1"
 #define AppPublisher "FlowerGraph"
 #define AppURL       ""
 #define AppExeName   "FlowerGraph.exe"
