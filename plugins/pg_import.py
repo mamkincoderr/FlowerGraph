@@ -1,5 +1,5 @@
 """
-Импорт файлов PowerGraph (.pgc) версии 3.x в FlowerGraph Block.
+Импорт файлов .pgc версии 3.x в FlowerGraph Block.
 
 Формат .pgc — бинарный little-endian:
   0x0000  "PGC\0" + uint16 ver_major + uint16 ver_minor
@@ -125,6 +125,6 @@ def load(path: str | Path) -> Block:
         times       = times,
         values      = values,
         description = (
-            f'Импорт PowerGraph v{ver_major}.{ver_minor} — {path.name}'
+            f'Импорт PGC v{ver_major}.{ver_minor} — {path.name}'
         ),
     )

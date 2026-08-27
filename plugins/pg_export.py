@@ -1,6 +1,6 @@
-"""Экспорт FlowerGraph Block в файл PowerGraph (.pgc).
+"""Экспорт FlowerGraph Block в файл .pgc (PGC v3.3).
 
-Формат PGC v3.3 (на основе анализа файлов PowerGraph):
+Формат PGC v3.3:
   Header  : 137 байт (0x89)
   PGGr    : 32 слота × 32 байта
   ADCh    : 32 слота × 72 байта

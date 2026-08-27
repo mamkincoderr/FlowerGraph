@@ -7,14 +7,14 @@
 **стройте графики по данным из различных источников**
 
 Самописец сигналов с COM-порта MCU.  
-Live-осциллограф, блоки, калибровка — без MATLAB и без PowerGraph.
+Live-осциллограф, блоки, калибровка — без MATLAB.
 
 <br>
 
 <img src="https://img.shields.io/badge/version-0.6.3.2-7F2F3F?style=for-the-badge">
 <img src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-4A3A2E?style=for-the-badge">
 <img src="https://img.shields.io/badge/Python-3.11-637043?style=for-the-badge">
-<img src="https://img.shields.io/badge/PowerGraph-.pgc-B24A5E?style=for-the-badge">
+<img src="https://img.shields.io/badge/.pgc-.fgd-.csv-B24A5E?style=for-the-badge">
 
 <br>
 
@@ -40,7 +40,7 @@ Live-осциллограф, блоки, калибровка — без MATLAB 
 
 | Было | Стало |
 |:-----|:------|
-| PowerGraph — платный, ASCII конца нулевых | FlowerGraph — ASCII + **COBS / mCOBS** |
+| Только текстовый ASCII по UART | FlowerGraph — ASCII + **COBS / mCOBS** |
 | MATLAB / Python-скрипт на каждый эксперимент | Окно, запись, блоки, маркеры |
 | Нет живого потока с CRC | Кадр, CRC-16, счётчик потерь |
 
@@ -58,7 +58,7 @@ Live-осциллограф, блоки, калибровка — без MATLAB 
 | **4 источника** | Генератор, COM ASCII, COM COBS, COM mCOBS | Стенд или проверка UI без железа |
 | **Шкала 1–2–5** | Время и амплитуда как на приборе | Маркеры, LOD min/max |
 | **Блоки** | Несколько дублей в одной сессии | Калибровка `.cal` |
-| **Файлы** | Свой `.fgd` (zip + npy) | Импорт / экспорт PowerGraph `.pgc`, CSV |
+| **Файлы** | Свой `.fgd` (zip + npy) | Импорт / экспорт `.pgc`, CSV |
 
 ---
 
@@ -68,7 +68,7 @@ MCU шлёт UART — FlowerGraph рисует.
 
 ```
 MCU ── UART ──►  FlowerGraph
-                   ├─ ASCII    ±DDDDD.D + CR     как PowerGraph
+                   ├─ ASCII    ±DDDDD.D + CR     текст, printf с MCU
                    ├─ COBS     int16…float32     CRC-16, потери пакетов
                    └─ mCOBS    пачка семплов     выше FPS
 ```
@@ -141,7 +141,7 @@ flowchart LR
 ```
 main.py          точка входа
 core/            сессия, кольцо, .fgd
-plugins/         источники, PowerGraph I/O
+plugins/         источники, .pgc / .fgd
 ui/              окно, график, панели
 install/         Inno, протоколы, build.bat
 assets/          сплэш, иконка

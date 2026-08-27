@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
-# Единицы измерения (как в PowerGraph + пользовательские)
+# Единицы измерения (типовые + пользовательские)
 # Поле редактируемое: любое значение можно ввести вручную
 PG_UNITS: list[str] = [
     '',
