@@ -1,7 +1,7 @@
 """
 MainWindow — главное окно FlowerGraph.
 
-Компоновка (по мотивам PowerGraph):
+Компоновка:
 
   ┌─ Меню ──────────────────────────────────────────────────┐
   ├─ Тулбар ────────────────────────────────────────────────┤
@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QFileDialog, QInputDialog
 )
 from PySide6.QtCore import QSize, QTimer, Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence, QIcon
 
 from core.config import config
 from core.session import Session, Block, ChannelInfo
@@ -55,7 +55,7 @@ from core.i18n import tr, set_lang, get_lang
 APP_NAME    = 'FlowerGraph'
 APP_VERSION = '0.6.3.2'
 FILE_FILTER    = 'FlowerGraph Data (*.fgd);;Все файлы (*)'
-PGC_FILTER     = 'PowerGraph Data (*.pgc);;Все файлы (*)'
+PGC_FILTER     = 'PGC (*.pgc);;Все файлы (*)'
 
 
 class AppState(Enum):
@@ -189,6 +189,9 @@ class MainWindow(QMainWindow):
     def _setup_window(self):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(1000, 680)
+        icon_path = Path(__file__).resolve().parent.parent / 'assets' / 'icon.ico'
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
 
     def _build_central(self):
         # Левая панель: шкала амплитуды
@@ -859,7 +862,7 @@ class MainWindow(QMainWindow):
             self._display_block(0)   # внутри вызывает _update_session_overview()
 
     def _on_import_pgc(self):
-        path, _ = QFileDialog.getOpenFileName(self, 'Импорт PowerGraph', '', PGC_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, 'Импорт .pgc', '', PGC_FILTER)
         if not path:
             return
         try:
@@ -1711,7 +1714,7 @@ class MainWindow(QMainWindow):
         if block is None:
             QMessageBox.information(self, 'Экспорт PGC', 'Нет активного блока для экспорта.')
             return
-        path, _ = QFileDialog.getSaveFileName(self, 'Экспорт в PowerGraph', '', PGC_FILTER)
+        path, _ = QFileDialog.getSaveFileName(self, 'Экспорт в .pgc', '', PGC_FILTER)
         if not path:
             return
         try:
