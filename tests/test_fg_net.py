@@ -168,14 +168,17 @@ class PacketTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_scope_stitch_default_on_and_roundtrips(self):
-        self.assertTrue(FgNetConfig().scope_stitch)
-        d = FgNetConfig(scope_stitch=False).to_dict()
-        self.assertIs(d["scope_stitch"], False)
-        self.assertIs(FgNetConfig.from_dict(d).scope_stitch, False)
+    def test_roundtrip_keeps_known_fields(self):
+        c = FgNetConfig(device_ip="10.0.0.5", telemetry_decim=6,
+                        channels=["scope.1", "sys.U_out"])
+        c2 = FgNetConfig.from_dict(c.to_dict())
+        self.assertEqual(c2.device_ip, "10.0.0.5")
+        self.assertEqual(c2.telemetry_decim, 6)
+        self.assertEqual(c2.channels, ["scope.1", "sys.U_out"])
 
     def test_has_scope(self):
         self.assertTrue(FgNetConfig(channels=["scope.1"]).has_scope())
+        self.assertTrue(FgNetConfig(channels=["sys.U_out", "scope.2"]).has_scope())
         self.assertFalse(FgNetConfig(channels=["sys.U_in"]).has_scope())
 
 

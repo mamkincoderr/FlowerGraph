@@ -11,9 +11,15 @@ FG-NET источник данных — приём телеметрии по Wi
   TCP  5001 — управление (PING/STATUS/START/STOP, heartbeat раз в 1 с)
   UDP  5002 — discovery (multicast 239.10.10.1)
 
-Осциллограф уходит в график через _emit(times, values) как временной ряд
-(61×3). Скалярная телеметрия — не через _emit, а в свойство .telemetry
-(dict), обновляется на каждый пакет (отображение — отдельная задача).
+Ось времени задаёт ФГ по своим часам: t = t_base + счётчик_отсчётов /
+измеренная_частота, частота калибруется по времени стены, t_base
+подстраивается — ряд непрерывный, без скачков и пропусков (как в
+com_ascii_source). Метка timestamp_us устройства на график НЕ идёт.
+Каждый пакет даёт: в режиме scope — scope_n отсчётов на канал (окно
+кладётся встык за предыдущим по шкале ФГ, ничего не отбрасывается —
+повтор буфера устройством = повтор формы); в режиме логгера — 1 отсчёт.
+Скалярная телеметрия — не через _emit, а в свойство .telemetry (dict),
+обновляется на каждый пакет (отображение — отдельная задача).
 """
 
 import gzip
@@ -324,17 +330,9 @@ class FgNetConfig:
     scope_scale:     float = 0.1
     # Делитель частоты телеметрии по служебному кадру внутреннего опроса
     # устройства (~400 Гц). Пакет на каждый N-й -> частота ≈ 400/N Гц. 0 = как 1.
-    # Осциллограмма повторяется между захватами (+ независимо ~10-14 Гц по
-    # завершению захвата). ВНИМАНИЕ: высокая частота нагружает HTTP устройства.
+    # Осциллограмма повторяется между захватами (устройство обновляет буфер
+    # ~10-14 Гц). ВНИМАНИЕ: высокая частота нагружает HTTP-сервер устройства.
     telemetry_decim: int = 4
-    # Осциллограф мастера — это снимок ~30 мс, а не непрерывный поток; он
-    # обновляется ~7-14 Гц, между снимками 70-120 мс без данных. Если класть
-    # каждый снимок по его абсолютной метке времени, трасса стоит и рывками
-    # прыгает вперёд с большими пустотами (визуальный «лаг»). scope_stitch=True
-    # клеит захваты встык — пауза между снимками схлопывается, трасса непрерывна
-    # (как на штатном дисплее мастера). False — реальная временная шкала с
-    # пустотами. На режим логгера (без scope-каналов) не влияет.
-    scope_stitch:    bool = True
     # какие сигналы писать/строить. Ключи — sys.<k> / dev<N>.<k> / scope.<c>.
     channels:        list[str] = field(default_factory=lambda: list(FGNET_DEFAULT_CHANNELS))
     # последняя полученная от устройства схема тела пакета (GET_SCHEMA) + её CRC.
@@ -364,7 +362,6 @@ class FgNetConfig:
             'discovery_group': self.discovery_group,
             'scope_rate': self.scope_rate, 'scope_scale': self.scope_scale,
             'telemetry_decim': self.telemetry_decim,
-            'scope_stitch': self.scope_stitch,
             'channels': list(self.channels),
             'schema': self.schema, 'schema_crc': self.schema_crc,
         }
@@ -560,11 +557,16 @@ class FgNetSource(BaseSource):
         self._pkt_err = 0
         self._pkt_lost = 0
         self._pkt_overflow = 0     # флаг OVERFLOW в заголовке — потери на плате
-        self._pkt_dup_scope = 0    # пакеты с повторным буфером scope (при прореживании)
         self._last_seq = -1
-        self._last_scope_key = None
-        self._t_offset_us = 0
-        self._scope_cursor = 0.0   # конец последнего склеенного окна scope (сек)
+        # Ось времени задаёт ФГ по своим часам (как com_ascii_source): счётчик
+        # отсчётов / измеренная частота, t_base подстраивается при калибровке —
+        # шкала непрерывна, без скачков. Метку timestamp_us устройства на график
+        # НЕ кладём (только в .telemetry для диагностики).
+        self._t_start = 0.0
+        self._t_base = 0.0
+        self._samp_count = 0
+        self._rate_est = 1.0
+        self._recal_at = 240          # пересчёт частоты каждые N пакетов
         self._sel = self._config.selected()   # зафиксировать на время сессии
         self._n_ch = len(self._sel)
 
@@ -591,12 +593,14 @@ class FgNetSource(BaseSource):
         return FgNetConfigDialog(self._config)
 
     def effective_sample_rate(self) -> int:
-        # scope выбран -> частота дискретизации осциллографа (~2000 Гц); иначе —
-        # темп пакетов: по scope ~12 Гц, либо ~400/decim при прореживании.
-        if self._config.has_scope() and self._config.scope_rate > 0:
-            return int(self._config.scope_rate)
-        d = max(1, self._config.telemetry_decim)
-        return 400 // d
+        # Частота отсчётов на шкале ФГ. Пока идёт приём — измеренная
+        # (_rate_est, калибруется по времени стены); до старта — оценка:
+        # пакеты ≈ 400/decim Гц, в режиме scope ×scope_n отсчётов на пакет.
+        if self._running and self._rate_est > 1.0:
+            return max(1, int(self._rate_est))
+        pkt_hz = 400.0 / max(1, self._config.telemetry_decim)
+        n = self._schema.scope_n if self._config.has_scope() else 1
+        return max(1, int(pkt_hz * n))
 
     def start(self) -> bool:
         if not self._config.device_ip:
@@ -630,11 +634,14 @@ class FgNetSource(BaseSource):
             return False
 
         self._pkt_ok = self._pkt_err = self._pkt_lost = self._pkt_overflow = 0
-        self._pkt_dup_scope = 0
         self._last_seq = -1
-        self._last_scope_key = None
-        self._t_offset_us = 0
-        self._scope_cursor = 0.0
+        self._t_start = time.perf_counter()
+        self._t_base = 0.0
+        self._samp_count = 0
+        # стартовая оценка: пакеты ≈ 400/decim Гц; в режиме scope на пакет
+        # приходит scope_n отсчётов, поэтому частота отсчётов в scope_n раз выше.
+        pkt_hz = 400.0 / max(1, self._config.telemetry_decim)
+        self._rate_est = pkt_hz * (self._schema.scope_n if self._config.has_scope() else 1)
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
@@ -676,10 +683,10 @@ class FgNetSource(BaseSource):
 
         sch         = self._schema
         has_scope   = self._config.has_scope()
-        stitch      = self._config.scope_stitch
         scope_scale = self._config.scope_scale
-        dt          = 1.0 / max(1, self._config.scope_rate)
-        idx61       = np.arange(sch.scope_n, dtype=np.float64)
+        n_sel       = len(self._sel)
+        rows_step   = sch.scope_n if has_scope else 1
+        row_idx     = np.arange(rows_step, dtype=np.float64)
 
         while self._running:
             try:
@@ -713,38 +720,16 @@ class FgNetSource(BaseSource):
             }
             self._pkt_ok += 1
 
-            # В режиме осциллографа: буфер захвата обновляется у устройства
-            # только ~10-14 Гц. При прореживании (decim) пакеты идут чаще, и один
-            # и тот же захват повторяется. Класть его в график повторно нельзя —
-            # окна 30.5 мс перекрываются, время идёт назад, pyqtgraph рисует мусор.
-            # Пропускаем пакет, если scope-блок не изменился.
-            if has_scope:
-                scope_key = scope.tobytes()
-                if scope_key == self._last_scope_key:
-                    self._pkt_dup_scope += 1
-                    continue
-                self._last_scope_key = scope_key
+            # Ось времени — ФГ, по своим часам. Каждый пакет даёт rows_step
+            # отсчётов (scope: scope_n; логгер: 1). Метки идут сплошняком по
+            # измеренной частоте отсчётов, t_base подстраивается при калибровке.
+            # Ничего не отбрасываем и не «клеим» под номинальный dt — что пришло,
+            # то и легло на шкалу ФГ. Повтор буфера scope устройством = повтор
+            # формы на графике (данные идут, передача не останавливается).
+            times = self._t_base + (self._samp_count + row_idx) / self._rate_est
+            self._samp_count += rows_step
 
-            # scope выбран -> окно 61 точки (раскладка [канал][выборка], 3 блока
-            # по 61), скаляры удерживаются постоянными. Иначе — один отсчёт на
-            # пакет по метке времени (логгер, частота = темп пакетов).
-            nrows = sch.scope_n if has_scope else 1
-
-            if has_scope and stitch:
-                # Клеим захваты встык: следующее окно начинается сразу за
-                # предыдущим. Паузы между снимками мастера (70-120 мс) убираются,
-                # трасса непрерывна — нет «лага»/рывков. Абсолютное время между
-                # захватами теряется (для осциллограммы это норма).
-                t0 = self._scope_cursor
-                self._scope_cursor = t0 + sch.scope_n * dt
-                times = t0 + idx61 * dt
-            else:
-                if self._t_offset_us == 0:
-                    self._t_offset_us = hdr.timestamp_us
-                t0 = (hdr.timestamp_us - self._t_offset_us) / 1_000_000.0
-                times = (t0 + idx61 * dt) if has_scope else np.array([t0], dtype=np.float64)
-
-            values = np.empty((nrows, len(self._sel)), dtype=np.float32)
+            values = np.empty((rows_step, n_sel), dtype=np.float32)
             for ci, key in enumerate(self._sel):
                 v = sch.resolve(key, devices, system, scope)
                 if isinstance(v, np.ndarray):
@@ -753,6 +738,9 @@ class FgNetSource(BaseSource):
                     values[:, ci] = v
 
             put_drop_oldest(self._queue, (times, values))
+
+            if self._pkt_ok % self._recal_at == 0:
+                self._calibrate_rate()
 
         try:
             sock.close()
@@ -765,6 +753,20 @@ class FgNetSource(BaseSource):
             if seq != expected:
                 self._pkt_lost += (seq - expected) & 0xFFFFFFFF
         self._last_seq = seq
+
+    def _calibrate_rate(self):
+        """Пересчёт частоты отсчётов по реальному времени стены (как
+        com_ascii_source._calibrate_rate). t_base подстраивается так, чтобы
+        текущая метка не изменилась — шкала остаётся непрерывной, без скачков."""
+        elapsed = time.perf_counter() - self._t_start
+        if elapsed < 1.0 or self._samp_count < 500:
+            return
+        measured = self._samp_count / elapsed
+        new_rate = self._rate_est + 0.15 * (measured - self._rate_est)
+        if new_rate <= 0:
+            return
+        self._t_base += self._samp_count * (1.0 / self._rate_est - 1.0 / new_rate)
+        self._rate_est = new_rate
 
     def _drain_queue(self):
         self._drain_errors()
@@ -790,7 +792,7 @@ class FgNetSource(BaseSource):
             'device_ip': self._config.device_ip,
             'pkt_ok': self._pkt_ok, 'pkt_err': self._pkt_err,
             'pkt_lost': self._pkt_lost, 'pkt_overflow': self._pkt_overflow,
-            'pkt_dup_scope': self._pkt_dup_scope,
+            'rate_est': int(self._rate_est),
             'n_ch': self._n_ch,
             'device_status': st,
         }
@@ -805,8 +807,7 @@ try:
     from PySide6.QtWidgets import (
         QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
         QPushButton, QListWidget, QListWidgetItem, QDialogButtonBox, QGroupBox,
-        QDoubleSpinBox, QSpinBox, QCheckBox, QTreeWidget, QTreeWidgetItem,
-        QAbstractItemView,
+        QDoubleSpinBox, QSpinBox, QTreeWidget, QTreeWidgetItem, QAbstractItemView,
     )
 except ImportError:  # headless (CI-тесты ставят только numpy) — диалог не создаётся
     class _NoQt:
@@ -815,8 +816,7 @@ except ImportError:  # headless (CI-тесты ставят только numpy) 
     QTimer = Qt = _NoQt()
     QDialog = QVBoxLayout = QHBoxLayout = QFormLayout = QLabel = QLineEdit = object
     QPushButton = QListWidget = QListWidgetItem = QDialogButtonBox = QGroupBox = object
-    QDoubleSpinBox = QSpinBox = QCheckBox = QTreeWidget = QTreeWidgetItem = object
-    QAbstractItemView = object
+    QDoubleSpinBox = QSpinBox = QTreeWidget = QTreeWidgetItem = QAbstractItemView = object
 
 
 class FgNetConfigDialog(QDialog):
@@ -870,23 +870,14 @@ class FgNetConfigDialog(QDialog):
                                   'штатном осциллографе устройства; 1.0 — сырые отсчёты.')
         form.addRow('Масштаб scope:', self._sb_scale)
 
-        self._cb_stitch = QCheckBox('Склеивать захваты (убрать паузы)')
-        self._cb_stitch.setChecked(self._config.scope_stitch)
-        self._cb_stitch.setToolTip(
-            'Осциллограф устройства — снимок ~30 мс, обновляется ~7-14 Гц;\n'
-            'между снимками 70-120 мс без данных. Вкл: захваты клеятся встык,\n'
-            'трасса непрерывна (нет рывков/«лага»), но абсолютное время между\n'
-            'снимками теряется. Выкл: реальная шкала времени с пустотами.\n'
-            'На режим логгера (без scope-каналов) не влияет.')
-        form.addRow('', self._cb_stitch)
-
         self._sb_decim = QSpinBox()
         self._sb_decim.setRange(0, 255)
         self._sb_decim.setValue(self._config.telemetry_decim)
         self._sb_decim.setToolTip(
             'Делитель частоты по служебному кадру опроса устройства (~400 Гц).\n'
             'Пакет на каждый N-й -> частота ≈ 400/N Гц. 0 = как 1 (~400 Гц).\n'
-            'Осциллограмма повторяется между захватами (+ ~10-14 Гц по захвату).\n'
+            'Буфер осциллографа устройство обновляет ~10-14 Гц — при N<3 форма\n'
+            'повторяется в соседних пакетах.\n'
             'ВНИМАНИЕ: высокая частота (N<4) нагружает HTTP-сервер устройства.')
         self._sb_decim.valueChanged.connect(lambda *_: self._update_hint())
         form.addRow('Прореживание:', self._sb_decim)
@@ -971,14 +962,17 @@ class FgNetConfigDialog(QDialog):
         keys = self._checked_keys()
         has_scope = any(k.startswith('scope.') for k in keys)
         d = max(1, self._sb_decim.value()) if hasattr(self, '_sb_decim') else 4
-        rate = f'~{400 // d} Гц (прореж. {d})'
+        pkt = 400 // d
         if not keys:
             txt = 'Ничего не выбрано — запишутся каналы по умолчанию.'
         elif has_scope:
-            txt = (f'{len(keys)} кан. Осциллограф обновляется ~10-14 Гц независимо от '
-                   f'прореживания (повторные захваты отбрасываются).')
+            txt = (f'{len(keys)} кан. Пакеты ~{pkt} Гц (прореж. {d}), '
+                   f'{self._schema.scope_n} отсч./пакет. Время — по часам ФГ, '
+                   f'сплошной ряд без пропусков; форма повторяется, пока буфер '
+                   f'устройства (~10-14 Гц) не обновится.')
         else:
-            txt = f'{len(keys)} кан. Логгер: 1 отсчёт/пакет, {rate}.'
+            txt = (f'{len(keys)} кан. Логгер: 1 отсч./пакет, ~{pkt} Гц (прореж. {d}). '
+                   f'Время — по часам ФГ.')
         self._lbl_hint.setText(txt)
 
     # ------------------------------------------------------------------
@@ -1065,7 +1059,6 @@ class FgNetConfigDialog(QDialog):
             scope_rate=self._sb_rate.value(),
             scope_scale=self._sb_scale.value(),
             telemetry_decim=self._sb_decim.value(),
-            scope_stitch=self._cb_stitch.isChecked(),
             channels=keys,
             schema=schema,
             schema_crc=(zlib.crc32(json.dumps(schema).encode()) if schema else 0),
