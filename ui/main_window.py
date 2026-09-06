@@ -14,6 +14,7 @@ MainWindow — главное окно FlowerGraph.
 """
 
 import os
+import sys
 import time
 import tempfile
 from enum import Enum, auto
@@ -48,13 +49,39 @@ from plugins.virtual_generator import VirtualGenerator, VirtualGeneratorDialog, 
 from plugins.com_ascii_source import ComAsciiSource, ComAsciiConfig
 from plugins.com_cobs_source import ComCobsSource, ComCobsConfig, ComCobsDialog
 from plugins.com_mcobs_source import ComMCobsSource, ComMCobsConfig, ComMCobsDialog
+from plugins.fg_net_source import FgNetSource, FgNetConfig, FgNetConfigDialog
 from plugins.base_source import BaseSource
 from plugins import pg_export
 from ui.com_ascii_dialog import ComAsciiDialog
 from core.i18n import tr, set_lang, get_lang
 
 APP_NAME    = 'FlowerGraph'
-APP_VERSION = '0.7.1'
+APP_VERSION = '0.7.1'   # базовая версия — извлекается CI регуляркой, не менять формат
+
+
+def _build_number() -> str:
+    """Номер сборки — 4-я компонента версии. В CI (GitHub Actions) берётся из
+    GITHUB_RUN_NUMBER, локально — из build_number.txt (инкрементит FlowerGraph.spec
+    при каждой PyInstaller-сборке). '0' если ничего не найдено."""
+    n = (os.environ.get('FG_BUILD_NUMBER')
+         or os.environ.get('GITHUB_RUN_NUMBER') or '').strip()
+    if n:
+        return n
+    for base in (getattr(sys, '_MEIPASS', None),
+                 str(Path(__file__).resolve().parent.parent)):
+        if not base:
+            continue
+        try:
+            v = (Path(base) / 'build_number.txt').read_text(encoding='utf-8').strip()
+            if v:
+                return v
+        except OSError:
+            pass
+    return '0'
+
+
+APP_BUILD        = _build_number()
+APP_VERSION_FULL = f'{APP_VERSION}.{APP_BUILD}'
 FILE_FILTER    = 'FlowerGraph Data (*.fgd);;Все файлы (*)'
 PGC_FILTER     = 'PGC (*.pgc);;Все файлы (*)'
 
@@ -70,12 +97,14 @@ class SourceType(Enum):
     COM_ASCII = 'com_ascii'
     COM_COBS  = 'com_cobs'
     COM_MCOBS = 'com_mcobs'
+    FG_NET    = 'fg_net'
 
 _SOURCE_LABELS = {
     SourceType.GENERATOR: 'Генератор',
     SourceType.COM_ASCII: 'COM ASCII',
     SourceType.COM_COBS:  'COM COBS',
     SourceType.COM_MCOBS: 'COM mCOBS',
+    SourceType.FG_NET:    'FG-NET (Wi-Fi)',
 }
 
 
@@ -111,6 +140,7 @@ class MainWindow(QMainWindow):
         self._com_config        = ComAsciiConfig()
         self._cobs_config       = ComCobsConfig()
         self._mcobs_config      = ComMCobsConfig()
+        self._fgnet_config      = FgNetConfig()
         self._current_sample_rate = 1000
 
         # виджеты
@@ -191,7 +221,7 @@ class MainWindow(QMainWindow):
     # ==================================================================
 
     def _setup_window(self):
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION_FULL}")
         self.setMinimumSize(1000, 680)
         icon = app_icon()
         if not icon.isNull():
@@ -309,6 +339,10 @@ class MainWindow(QMainWindow):
         d = config.get('source_mcobs', default=None)
         if isinstance(d, dict):
             self._mcobs_config = ComMCobsConfig.from_dict(d)
+
+        d = config.get('source_fgnet', default=None)
+        if isinstance(d, dict):
+            self._fgnet_config = FgNetConfig.from_dict(d)
 
         d = config.get('source_generator', default=None)
         if isinstance(d, dict):
@@ -741,6 +775,9 @@ class MainWindow(QMainWindow):
         elif st == SourceType.COM_MCOBS:
             src = ComMCobsSource(self._mcobs_config)
             cfg_n_ch = self._mcobs_config.n_channels
+        elif st == SourceType.FG_NET:
+            src = FgNetSource(self._fgnet_config)
+            cfg_n_ch = -1
         else:
             src = VirtualGenerator(self._gen_config)
             cfg_n_ch = -1
@@ -1359,7 +1396,7 @@ class MainWindow(QMainWindow):
         self._channel_panel.setup([], [])
         self._amp_scale.setup([], [])
         self._refresh_block_list()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION_FULL}")
         self._lbl_source.setText('Источник: нет')
         self._lbl_mode.setText('')
 
@@ -1452,6 +1489,8 @@ class MainWindow(QMainWindow):
             self._configure_com_cobs()
         elif st == SourceType.COM_MCOBS:
             self._configure_com_mcobs()
+        elif st == SourceType.FG_NET:
+            self._configure_fgnet()
 
     def _configure_generator(self):
         if self._state != AppState.IDLE:
@@ -1491,6 +1530,13 @@ class MainWindow(QMainWindow):
         dlg = ComMCobsDialog(self._mcobs_config, parent=self)
         if dlg.exec():
             self._mcobs_config = dlg.get_mcobs_config()
+
+    def _configure_fgnet(self):
+        if self._state != AppState.IDLE:
+            return
+        dlg = FgNetConfigDialog(self._fgnet_config, parent=self)
+        if dlg.exec():
+            self._fgnet_config = dlg.get_config()
 
     # Обратная совместимость с пунктами меню
     def _on_generator_config(self):
@@ -1538,7 +1584,7 @@ class MainWindow(QMainWindow):
         fp   = self._session.file_path
         name = Path(fp).name if fp else 'новый файл'
         mark = ' *' if self._session.modified else ''
-        self.setWindowTitle(f'{APP_NAME} — {name}{mark}')
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION_FULL} — {name}{mark}")
 
     def _update_recent_menu(self):
         self._menu_recent.clear()
@@ -1867,7 +1913,7 @@ class MainWindow(QMainWindow):
     def _on_about(self):
         QMessageBox.about(
             self, f'О программе {APP_NAME}',
-            f'<b>{APP_NAME}</b> v{APP_VERSION}<br>'
+            f'<b>{APP_NAME}</b> v{APP_VERSION_FULL}<br>'
             'Регистрация, визуализация и анализ сигналов.<br><br>'
             'Python + PySide6 + pyqtgraph'
         )
@@ -1942,6 +1988,7 @@ class MainWindow(QMainWindow):
         config.set('source_ascii',     value=self._com_config.to_dict())
         config.set('source_cobs',      value=self._cobs_config.to_dict())
         config.set('source_mcobs',     value=self._mcobs_config.to_dict())
+        config.set('source_fgnet',     value=self._fgnet_config.to_dict())
         config.set('source_generator', value=self._gen_config.to_dict())
         config.save()
         if getattr(self, '_tray', None) is not None:

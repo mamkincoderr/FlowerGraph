@@ -28,3 +28,6 @@ install/*.zip
 # OS
 .DS_Store
 Thumbs.db
+
+# Номер сборки — создаётся FlowerGraph.spec
+build_number.txt

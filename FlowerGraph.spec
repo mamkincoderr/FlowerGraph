@@ -4,9 +4,30 @@ PyInstaller spec для FlowerGraph.
 Сборка: cd FlowerGraph && .venv\Scripts\pyinstaller FlowerGraph.spec --clean
 """
 
+import os as _os
+from pathlib import Path as _Path
+
 from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
+
+# Номер сборки (4-я компонента версии). build_number.txt в .gitignore — этот
+# блок создаёт/обновляет его при каждой сборке и кладёт в дистрибутив (datas).
+#   CI (GitHub Actions): берём GITHUB_RUN_NUMBER (или FG_BUILD_NUMBER) как есть
+#   локально:            инкремент предыдущего значения
+_bn_path = _Path('build_number.txt')
+_env_bn = (_os.environ.get('FG_BUILD_NUMBER')
+           or _os.environ.get('GITHUB_RUN_NUMBER') or '').strip()
+if _env_bn:
+    _bn_path.write_text(_env_bn)
+    print(f'[spec] build_number.txt <- FG_BUILD_NUMBER {_env_bn}')
+else:
+    try:
+        _bn = int((_bn_path.read_text().strip() or '0')) + 1
+    except (OSError, ValueError):
+        _bn = 1
+    _bn_path.write_text(str(_bn))
+    print(f'[spec] build_number.txt -> {_bn}')
 
 # pyqtgraph: цветовые карты и шаблоны UI
 pyqtgraph_datas = collect_data_files('pyqtgraph')
@@ -15,7 +36,7 @@ a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=[],
-    datas=pyqtgraph_datas + [('assets', 'assets')],
+    datas=pyqtgraph_datas + [('assets', 'assets'), ('build_number.txt', '.')],
     hiddenimports=[
         'serial',
         'serial.tools.list_ports',
@@ -42,6 +63,7 @@ a = Analysis(
         'plugins.com_ascii_source',
         'plugins.com_cobs_source',
         'plugins.com_mcobs_source',
+        'plugins.fg_net_source',
         'plugins.pg_import',
         'plugins.pg_export',
         'core.i18n',
