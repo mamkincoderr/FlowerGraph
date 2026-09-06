@@ -16,6 +16,8 @@ FG-NET источник данных — приём телеметрии по Wi
 (dict), обновляется на каждый пакет (отображение — отдельная задача).
 """
 
+import gzip
+import json
 import queue
 import socket
 import struct
@@ -25,42 +27,23 @@ import zlib
 from dataclasses import dataclass, field
 
 import numpy as np
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
-    QPushButton, QListWidget, QListWidgetItem, QDialogButtonBox, QGroupBox,
-    QDoubleSpinBox, QSpinBox, QTreeWidget, QTreeWidgetItem, QAbstractItemView,
-)
 
 from plugins.base_source import BaseSource, put_drop_oldest
 
+# PySide6 импортируется лениво (перед классом диалога, ниже): слой разбора
+# пакета и схемы — FgNetSchema, parse_packet, parse_schema_payload,
+# fetch_schema — от Qt не зависит и обязан импортироваться в headless-окружении
+# (CI-джоб `test` ставит только numpy). См. tests/test_fg_net.py.
+
 
 # ---------------------------------------------------------------------------
-# Формат пакета — единый источник истины с ESP32 (fg_net_wire.h)
+# Транспорт — фиксирован (fg_net_wire.h). Раскладку ТЕЛА пакета описывает
+# схема, которую устройство отдаёт по GET_SCHEMA (см. FgNetSchema ниже).
 # ---------------------------------------------------------------------------
 
 _HDR_FMT   = '<4sBBBIIQBBBH'
 _HDR_SIZE  = struct.calcsize(_HDR_FMT)          # 28
 _MAGIC     = b'FGNT'
-
-_DEV_FMT   = '<11f6I5B3hB'
-_DEV_SIZE  = struct.calcsize(_DEV_FMT)          # 80
-_SYS_FMT   = '<9f2I2If2I2I4f'
-_SYS_SIZE  = struct.calcsize(_SYS_FMT)          # 88
-_SCOPE_FMT = '<B183h'
-_SCOPE_SIZE = struct.calcsize(_SCOPE_FMT)       # 367
-
-_BODY_SIZE = 6 * _DEV_SIZE + _SYS_SIZE + _SCOPE_SIZE     # 935
-_PKT_SIZE  = _HDR_SIZE + _BODY_SIZE + 4                  # 967
-
-assert (_DEV_SIZE, _SYS_SIZE, _SCOPE_SIZE) == (80, 88, 367), \
-    (_DEV_SIZE, _SYS_SIZE, _SCOPE_SIZE)
-assert _BODY_SIZE == 935 and _PKT_SIZE == 967
-
-# смещения блоков внутри body
-_OFF_SYS   = 6 * _DEV_SIZE      # 480
-_OFF_SCOPE = _OFF_SYS + _SYS_SIZE   # 568
-assert _OFF_SYS == 480 and _OFF_SCOPE == 568
 
 FGNET_VERSION = 0x01
 FGNET_TYPE_DATA               = 0x01
@@ -73,80 +56,202 @@ FGNET_FLAG_CLOCK_UNSYNCED = 1 << 1
 
 _CMD_PING, _CMD_PONG          = 0x01, 0x02
 _CMD_GET_STATUS, _CMD_STATUS  = 0x10, 0x11
+_CMD_GET_SCHEMA, _CMD_SCHEMA  = 0x12, 0x13
 _CMD_START, _CMD_STOP         = 0x20, 0x21
 _CMD_ACK, _CMD_ERROR          = 0x22, 0x30
 
-# имена полей телеметрии — порядок = _DEV_FMT / _SYS_FMT
-_DEV_FIELDS = (
-    'Uo_RMS', 'Uin_RMS', 'Iin_RMS', 'Iout_RMS', 'Udc', 'Ia_RMS', 'Fgrid',
-    'T_module', 'T_dross', 'HalfRef', 'V15v',
-    'CPU_Load', 'MAX_CPU_Load', 'SoftVersion', 'error_code', 'UID1', 'UID2',
-    'ENA', 'Mode1', 'Mode2', 'Cmd', 'Index', 'Ref1', 'Ref2', 'DataTor',
-    'state',
-)
-_SYS_FIELDS = (
-    'U_in', 'U_out', 'I_in', 'I_out', 'W_Full', 'P_Activ', 'Q_Reactiv',
-    'P_nom', 'F_sr', 'State_CountDownn', 'ErrCode', 'Soft_V_master',
-    'Soft_V_slave', 'U_Supp', 'LifeTime', 'SesionTime', 'Fan_rev_L',
-    'Fan_rev_H', 'Trad', 'Tdr', 'Q_fan', 'N_fan',
-)
+# struct-код по типу поля из схемы
+_T_STRUCT = {'f': 'f', 'I': 'I', 'i': 'i', 'H': 'H', 'h': 'h', 'B': 'B', 'b': 'b'}
+_T_SIZE   = {'f': 4, 'I': 4, 'i': 4, 'H': 2, 'h': 2, 'B': 1, 'b': 1}
 
-SCOPE_N  = 61
-SCOPE_CH = 3
 
 # ---------------------------------------------------------------------------
-# Каталог сигналов, доступных для записи. Ключ -> метка.
-#   sys.<поле>      — общесистемный блок (одно значение на пакет, ~10-14 Гц)
-#   dev<1..6>.<поле> — запись устройства N
-#   scope.<1..3>    — канал осциллографа (61 точка на пакет, дискретизация 2000 Гц)
-# Скалярная телеметрия и осциллограф вместе: скаляры удерживаются постоянными
-# на все 62 точки окна scope (ступенька) — стандартно для логгера.
+# Схема тела пакета — самоописание от устройства (GET_SCHEMA -> JSON).
+# Разбирает: раскладку байт (из порядка+типов полей), подписи, единицы,
+# каналы по умолчанию, параметры осциллографа. Если устройство схему не
+# отдало — используется _DEFAULT_SCHEMA (generic-подписи).
 # ---------------------------------------------------------------------------
-_SYS_LOG_FIELDS = [
-    ('U_in',  'U вход'),      ('U_out', 'U выход'),    ('I_in',  'I вход'),
-    ('I_out', 'I выход'),     ('W_Full', 'S полная'),  ('P_Activ', 'P активная'),
-    ('Q_Reactiv', 'Q реакт.'), ('F_sr', 'Частота'),    ('U_Supp', 'U питания'),
-    ('Trad', 'T радиатор'),   ('Tdr', 'T дроссель'),   ('N_fan', 'Обороты вент.'),
-    ('State_CountDownn', 'Состояние'), ('ErrCode', 'Код ошибки'),
-]
-_DEV_LOG_FIELDS = [
-    ('Uo_RMS', 'Uвых'),   ('Uin_RMS', 'Uвх'),  ('Iin_RMS', 'Iвх'),
-    ('Iout_RMS', 'Iвых'), ('Udc', 'Udc'),      ('Ia_RMS', 'Ia'),
-    ('Fgrid', 'Частота'), ('T_module', 'T модуль'), ('T_dross', 'T дроссель'),
-    ('V15v', '15В'),      ('state', 'Состояние'),   ('error_code', 'Код ош.'),
-]
-_SCOPE_LOG = [('scope.1', 'Scope 1'), ('scope.2', 'Scope 2'), ('scope.3', 'Scope 3')]
 
-FGNET_DEFAULT_CHANNELS = ['sys.U_in', 'sys.U_out', 'sys.I_out']
+# Встроенная схема-заглушка: раскладка STRUCTURED_V1, обезличенные подписи.
+_DEFAULT_SCHEMA = {
+    "schema": 1, "profile": "STRUCTURED_V1",
+    "packet": {"hdr": 28, "body": 935, "crc": 4},
+    "blocks": [
+        {"id": "dev", "repeat": 6, "size": 80, "label": "Устройство %d", "fields": [
+            {"k": k, "t": t} for k, t in [
+                ("Uo_RMS", "f"), ("Uin_RMS", "f"), ("Iin_RMS", "f"), ("Iout_RMS", "f"),
+                ("Udc", "f"), ("Ia_RMS", "f"), ("Fgrid", "f"), ("T_module", "f"),
+                ("T_dross", "f"), ("HalfRef", "f"), ("V15v", "f"),
+                ("CPU_Load", "I"), ("MAX_CPU_Load", "I"), ("SoftVersion", "I"),
+                ("error_code", "I"), ("UID1", "I"), ("UID2", "I"),
+                ("ENA", "B"), ("Mode1", "B"), ("Mode2", "B"), ("Cmd", "B"), ("Index", "B"),
+                ("Ref1", "h"), ("Ref2", "h"), ("DataTor", "h"), ("state", "B"),
+            ]]},
+        {"id": "sys", "size": 88, "label": "Система", "fields": [
+            {"k": k, "t": t, **({"d": 1} if k in ("U_in", "U_out", "I_out") else {})}
+            for k, t in [
+                ("U_in", "f"), ("U_out", "f"), ("I_in", "f"), ("I_out", "f"),
+                ("W_Full", "f"), ("P_Activ", "f"), ("Q_Reactiv", "f"), ("P_nom", "f"),
+                ("F_sr", "f"), ("State_CountDownn", "I"), ("ErrCode", "I"),
+                ("Soft_V_master", "I"), ("Soft_V_slave", "I"), ("U_Supp", "f"),
+                ("LifeTime", "I"), ("SesionTime", "I"), ("Fan_rev_L", "I"), ("Fan_rev_H", "I"),
+                ("Trad", "f"), ("Tdr", "f"), ("Q_fan", "f"), ("N_fan", "f"),
+            ]]},
+        {"id": "scope", "n": 61, "ch": 3, "scale": 0.1, "label": "Осциллограф",
+         "channels": [{"l": "CH1"}, {"l": "CH2"}, {"l": "CH3"}]},
+    ],
+}
 
 
-def _channel_label(key: str) -> str:
-    if key.startswith('sys.'):
-        f = key[4:]
-        return dict(_SYS_LOG_FIELDS).get(f, f)
-    if key.startswith('scope.'):
-        return dict(_SCOPE_LOG).get(key, key)
-    if key.startswith('dev') and '.' in key:
-        n, f = key[3:].split('.', 1)
-        return f'M{n} ' + dict(_DEV_LOG_FIELDS).get(f, f)
-    return key
+class FgNetSchema:
+    """Разобранная схема тела пакета."""
+
+    def __init__(self, d: dict):
+        self.raw = d
+        self.version = d.get("schema", 1)
+        self.profile = d.get("profile", "STRUCTURED_V1")
+        blk = {b["id"]: b for b in d["blocks"]}
+        dev, sys_, sc = blk["dev"], blk["sys"], blk["scope"]
+
+        self.dev_count = int(dev.get("repeat", 6))
+        self.dev_keys  = [f["k"] for f in dev["fields"]]
+        self.dev_fmt   = "<" + "".join(_T_STRUCT[f["t"]] for f in dev["fields"])
+        self.dev_size  = struct.calcsize(self.dev_fmt)
+        self.sys_keys  = [f["k"] for f in sys_["fields"]]
+        self.sys_fmt   = "<" + "".join(_T_STRUCT[f["t"]] for f in sys_["fields"])
+        self.sys_size  = struct.calcsize(self.sys_fmt)
+        self.scope_n     = int(sc["n"])
+        self.scope_ch    = int(sc.get("ch", 3))
+        self.scope_scale = float(sc.get("scale", 0.1))
+        self.scope_size  = 1 + self.scope_n * self.scope_ch * 2
+
+        self.off_sys   = self.dev_count * self.dev_size
+        self.off_scope = self.off_sys + self.sys_size
+        self.body_size = self.off_scope + self.scope_size
+        self.pkt_size  = _HDR_SIZE + self.body_size + 4
+
+        # sanity: declared vs computed
+        for b, sz in ((dev, self.dev_size), (sys_, self.sys_size)):
+            if "size" in b and b["size"] != sz:
+                raise ValueError(f'schema block {b["id"]}: size {b["size"]} != {sz}')
+        pk = d.get("packet", {})
+        if pk.get("body") and pk["body"] != self.body_size:
+            raise ValueError(f'schema body {pk["body"]} != {self.body_size}')
+
+        # подписи / единицы / дефолт
+        self._dev_lbl  = {f["k"]: f.get("l", f["k"]) for f in dev["fields"]}
+        self._sys_lbl  = {f["k"]: f.get("l", f["k"]) for f in sys_["fields"]}
+        self._dev_unit = {f["k"]: f.get("u", "") for f in dev["fields"]}
+        self._sys_unit = {f["k"]: f.get("u", "") for f in sys_["fields"]}
+        self._sc_lbl   = [c.get("l", f"CH{i+1}") for i, c in enumerate(sc.get("channels", []))]
+        self._sc_unit  = [c.get("u", "") for c in sc.get("channels", [])]
+        self.dev_group   = dev.get("label", "Устройство %d")
+        self.sys_group   = sys_.get("label", "Система")
+        self.scope_group = sc.get("label", "Осциллограф")
+        self._dev_def = {f["k"] for f in dev["fields"] if f.get("d")}
+        self._sys_def = {f["k"] for f in sys_["fields"] if f.get("d")}
+
+    # -- каталог сигналов для дерева -----------------------------------
+
+    def groups(self):
+        """[(заголовок, [(key, label), ...]), ...] для дерева выбора."""
+        out = [(self.sys_group,
+                [(f"sys.{k}", self._sys_lbl[k]) for k in self.sys_keys])]
+        for n in range(1, self.dev_count + 1):
+            title = self.dev_group % n if "%" in self.dev_group else f"{self.dev_group} {n}"
+            out.append((title, [(f"dev{n}.{k}", self._dev_lbl[k]) for k in self.dev_keys]))
+        out.append((self.scope_group,
+                    [(f"scope.{i+1}", self._sc_lbl[i] if i < len(self._sc_lbl) else f"Scope {i+1}")
+                     for i in range(self.scope_ch)]))
+        return out
+
+    def default_channels(self):
+        keys = [f"sys.{k}" for k in self.sys_keys if k in self._sys_def]
+        keys += [f"dev1.{k}" for k in self.dev_keys if k in self._dev_def]
+        return keys or ([f"sys.{self.sys_keys[0]}"] if self.sys_keys else [])
+
+    def label(self, key: str) -> str:
+        if key.startswith("sys."):
+            return self._sys_lbl.get(key[4:], key[4:])
+        if key.startswith("scope."):
+            i = int(key.split(".", 1)[1]) - 1
+            return self._sc_lbl[i] if 0 <= i < len(self._sc_lbl) else key
+        if key.startswith("dev") and "." in key:
+            n, k = key[3:].split(".", 1)
+            return f"М{n} " + self._dev_lbl.get(k, k)
+        return key
+
+    # -- разбор одного пакета -----------------------------------------
+
+    def to_dict(self):
+        return self.raw
+
+    def parse_body(self, body: bytes):
+        devices = [dict(zip(self.dev_keys, struct.unpack_from(self.dev_fmt, body, i * self.dev_size)))
+                   for i in range(self.dev_count)]
+        system = dict(zip(self.sys_keys, struct.unpack_from(self.sys_fmt, body, self.off_sys)))
+        n = self.scope_n * self.scope_ch
+        scope = np.asarray(struct.unpack_from(f"<{n}h", body, self.off_scope + 1), dtype=np.int16)
+        return devices, system, scope
+
+    def resolve(self, key: str, devices: list, system: dict, scope: np.ndarray):
+        """Значение канала: скаляр или np.ndarray(scope_n,)."""
+        if key.startswith("sys."):
+            return float(system.get(key[4:], 0.0))
+        if key.startswith("scope."):
+            c = int(key.split(".", 1)[1]) - 1
+            if 0 <= c < self.scope_ch:
+                return scope[c * self.scope_n:(c + 1) * self.scope_n].astype(np.float32)
+            return np.zeros(self.scope_n, dtype=np.float32)
+        if key.startswith("dev") and "." in key:
+            n, k = key[3:].split(".", 1)
+            i = int(n) - 1
+            if 0 <= i < len(devices):
+                return float(devices[i].get(k, 0.0))
+        return 0.0
+
+    @classmethod
+    def default(cls):
+        return cls(_DEFAULT_SCHEMA)
 
 
-def _resolve_channel(key: str, devices: list, system: dict, scope: np.ndarray):
-    """Значение канала из разобранного пакета: скаляр или np.ndarray(61,)."""
-    if key.startswith('sys.'):
-        return float(system.get(key[4:], 0.0))
-    if key.startswith('scope.'):
-        c = int(key.split('.', 1)[1]) - 1
-        if 0 <= c < SCOPE_CH:
-            return scope[c * SCOPE_N:(c + 1) * SCOPE_N].astype(np.float32)
-        return np.zeros(SCOPE_N, dtype=np.float32)
-    if key.startswith('dev') and '.' in key:
-        n, f = key[3:].split('.', 1)
-        i = int(n) - 1
-        if 0 <= i < len(devices):
-            return float(devices[i].get(f, 0.0))
-    return 0.0
+FGNET_DEFAULT_CHANNELS = FgNetSchema.default().default_channels()  # sys.U_in/U_out/I_out
+
+
+def parse_schema_payload(payload: bytes) -> dict | None:
+    """Payload ответа SCHEMA -> dict. gzip (магия 1f 8b) распаковывается."""
+    try:
+        raw = gzip.decompress(payload) if payload[:2] == b"\x1f\x8b" else payload
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def fetch_schema(ip: str, control_port: int = 5001, timeout: float = 2.5) -> dict | None:
+    """Короткий TCP-connect к устройству, GET_SCHEMA -> dict или None."""
+    try:
+        s = socket.create_connection((ip, control_port), timeout=timeout)
+        s.settimeout(timeout)
+        s.sendall(struct.pack("<BH", _CMD_GET_SCHEMA, 0))
+        h = b""
+        while len(h) < 3:
+            c = s.recv(3 - len(h))
+            if not c:
+                s.close(); return None
+            h += c
+        ln = h[1] | (h[2] << 8)
+        p = b""
+        while len(p) < ln:
+            c = s.recv(min(4096, ln - len(p)))
+            if not c:
+                break
+            p += c
+        s.close()
+        if h[0] != _CMD_SCHEMA or len(p) != ln:
+            return None
+        return parse_schema_payload(p)
+    except OSError:
+        return None
 
 
 class FgNetHeader:
@@ -169,42 +274,34 @@ def parse_header(raw: bytes):
 
 
 def parse_announce(payload: bytes) -> dict:
-    # fgnet_announce_t: BB B I B  char[32]  == 40
+    # fgnet_announce_t: BB B I B  char[32]  [+ I schema_crc]  (40 или 44 Б)
     if len(payload) < 40:
         return {}
     maj, minr, mch, msr, state = struct.unpack_from('<BBBIB', payload, 0)
     name = payload[8:40].split(b'\x00', 1)[0].decode('utf-8', 'replace')
-    return dict(fw=f'{maj}.{minr}', max_channels=mch, max_sample_rate=msr,
-               state=state, name=name)
+    d = dict(fw=f'{maj}.{minr}', max_channels=mch, max_sample_rate=msr,
+             state=state, name=name)
+    if len(payload) >= 44:
+        d['schema_crc'] = struct.unpack_from('<I', payload, 40)[0]
+    return d
 
 
-def parse_packet(raw: bytes):
-    """-> (FgNetHeader, list[dict] devices, dict system, np.int16[183] scope) | None"""
-    if len(raw) != _PKT_SIZE:
+def parse_packet(raw: bytes, schema: FgNetSchema):
+    """-> (FgNetHeader, list[dict] devices, dict system, np.int16 scope) | None"""
+    if len(raw) != schema.pkt_size:
         return None
     hdr = parse_header(raw)
     if hdr is None or hdr.type != FGNET_TYPE_DATA \
             or hdr.sample_format != FGNET_FMT_STRUCTURED_V1:
         return None
 
-    crc_rx = struct.unpack_from('<I', raw, _HDR_SIZE + _BODY_SIZE)[0]
-    if zlib.crc32(raw[:_HDR_SIZE + _BODY_SIZE]) != crc_rx:
+    end = _HDR_SIZE + schema.body_size
+    crc_rx = struct.unpack_from('<I', raw, end)[0]
+    if zlib.crc32(raw[:end]) != crc_rx:
         return None
 
-    body = raw[_HDR_SIZE:_HDR_SIZE + _BODY_SIZE]
-
-    devices = []
-    for i in range(6):
-        vals = struct.unpack_from(_DEV_FMT, body, i * _DEV_SIZE)
-        devices.append(dict(zip(_DEV_FIELDS, vals)))
-
-    sys_vals = struct.unpack_from(_SYS_FMT, body, _OFF_SYS)
-    system = dict(zip(_SYS_FIELDS, sys_vals))
-
-    scope = struct.unpack_from(_SCOPE_FMT, body, _OFF_SCOPE)  # (N, d0..d182)
-    scope_data = np.asarray(scope[1:1 + SCOPE_N * SCOPE_CH], dtype=np.int16)
-
-    return hdr, devices, system, scope_data
+    devices, system, scope = schema.parse_body(raw[_HDR_SIZE:end])
+    return hdr, devices, system, scope
 
 
 # ---------------------------------------------------------------------------
@@ -230,14 +327,26 @@ class FgNetConfig:
     # Осциллограмма повторяется между захватами (+ независимо ~10-14 Гц по
     # завершению захвата). ВНИМАНИЕ: высокая частота нагружает HTTP устройства.
     telemetry_decim: int = 4
-    # какие сигналы писать/строить. Ключи — см. каталог выше.
+    # какие сигналы писать/строить. Ключи — sys.<k> / dev<N>.<k> / scope.<c>.
     channels:        list[str] = field(default_factory=lambda: list(FGNET_DEFAULT_CHANNELS))
+    # последняя полученная от устройства схема тела пакета (GET_SCHEMA) + её CRC.
+    # Хранится, чтобы диалог/источник работали, если устройство недоступно.
+    schema:          dict | None = None
+    schema_crc:      int = 0
 
     def selected(self) -> list[str]:
         return list(self.channels) if self.channels else list(FGNET_DEFAULT_CHANNELS)
 
     def has_scope(self) -> bool:
         return any(k.startswith('scope.') for k in self.selected())
+
+    def make_schema(self) -> 'FgNetSchema':
+        if self.schema:
+            try:
+                return FgNetSchema(self.schema)
+            except Exception:
+                pass
+        return FgNetSchema.default()
 
     def to_dict(self) -> dict:
         return {
@@ -248,6 +357,7 @@ class FgNetConfig:
             'scope_rate': self.scope_rate, 'scope_scale': self.scope_scale,
             'telemetry_decim': self.telemetry_decim,
             'channels': list(self.channels),
+            'schema': self.schema, 'schema_crc': self.schema_crc,
         }
 
     @classmethod
@@ -449,7 +559,9 @@ class FgNetSource(BaseSource):
         self._n_ch = len(self._sel)
 
         self._telemetry: dict = {}
+        self._schema = self._config.make_schema()
 
+        from PySide6.QtCore import QTimer
         self._drain_timer = QTimer()
         self._drain_timer.timeout.connect(self._drain_queue)
 
@@ -463,7 +575,7 @@ class FgNetSource(BaseSource):
         return self._n_ch or len(FGNET_DEFAULT_CHANNELS)
 
     def get_channel_names(self) -> list[str]:
-        return [_channel_label(k) for k in self._sel]
+        return [self._schema.label(k) for k in self._sel]
 
     def get_config_widget(self):
         return FgNetConfigDialog(self._config)
@@ -481,6 +593,18 @@ class FgNetSource(BaseSource):
             self._emit_error('FG-NET: устройство не выбрано')
             self._drain_errors()
             return False
+
+        # свежая схема тела пакета от устройства (иначе — из конфига / дефолт)
+        d = fetch_schema(self._config.device_ip, self._config.control_port)
+        if d:
+            try:
+                self._schema = FgNetSchema(d)
+                self._config.schema = d
+                self._config.schema_crc = zlib.crc32(json.dumps(d).encode())
+            except Exception as e:
+                self._emit_error(f'FG-NET: схема устройства не разобрана ({e}), беру прежнюю')
+        self._sel = self._config.selected()
+        self._n_ch = len(self._sel)
 
         try:
             self._control = FgNetControl(self._config.device_ip,
@@ -539,10 +663,11 @@ class FgNetSource(BaseSource):
             self._running = False
             return
 
+        sch         = self._schema
         has_scope   = self._config.has_scope()
         scope_scale = self._config.scope_scale
         dt          = 1.0 / max(1, self._config.scope_rate)
-        idx61       = np.arange(SCOPE_N, dtype=np.float64)
+        idx61       = np.arange(sch.scope_n, dtype=np.float64)
 
         while self._running:
             try:
@@ -557,7 +682,7 @@ class FgNetSource(BaseSource):
                 self._emit_error(f'FG-NET: приём UDP — {e}')
                 continue
 
-            res = parse_packet(raw)
+            res = parse_packet(raw, sch)
             if res is None:
                 self._pkt_err += 1
                 continue
@@ -595,12 +720,12 @@ class FgNetSource(BaseSource):
             # scope выбран -> окно 61 точки (раскладка [канал][выборка], 3 блока
             # по 61), скаляры удерживаются постоянными. Иначе — один отсчёт на
             # пакет по метке времени (логгер, частота = темп пакетов).
-            nrows = SCOPE_N if has_scope else 1
+            nrows = sch.scope_n if has_scope else 1
             times = (t0 + idx61 * dt) if has_scope else np.array([t0], dtype=np.float64)
 
             values = np.empty((nrows, len(self._sel)), dtype=np.float32)
             for ci, key in enumerate(self._sel):
-                v = _resolve_channel(key, devices, system, scope)
+                v = sch.resolve(key, devices, system, scope)
                 if isinstance(v, np.ndarray):
                     values[:, ci] = v * scope_scale
                 else:
@@ -654,12 +779,34 @@ class FgNetSource(BaseSource):
 # Диалог настройки
 # ---------------------------------------------------------------------------
 
+try:
+    from PySide6.QtCore import QTimer, Qt
+    from PySide6.QtWidgets import (
+        QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
+        QPushButton, QListWidget, QListWidgetItem, QDialogButtonBox, QGroupBox,
+        QDoubleSpinBox, QSpinBox, QTreeWidget, QTreeWidgetItem, QAbstractItemView,
+    )
+except ImportError:  # headless (CI-тесты ставят только numpy) — диалог не создаётся
+    class _NoQt:
+        def __getattr__(self, name):
+            raise RuntimeError("PySide6 не установлен: GUI FG-NET недоступен")
+    QTimer = Qt = _NoQt()
+    QDialog = QVBoxLayout = QHBoxLayout = QFormLayout = QLabel = QLineEdit = object
+    QPushButton = QListWidget = QListWidgetItem = QDialogButtonBox = QGroupBox = object
+    QDoubleSpinBox = QSpinBox = QTreeWidget = QTreeWidgetItem = QAbstractItemView = object
+
+
 class FgNetConfigDialog(QDialog):
     def __init__(self, config: FgNetConfig | None = None, parent=None):
         super().__init__(parent)
         self._config = config or FgNetConfig()
         self.setWindowTitle('Настройка FG-NET источника')
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(440)
+
+        self._schema = self._config.make_schema()
+        self._schema_from_device = bool(self._config.schema)
+        self._inbox_schema = None      # (ip, dict) от фонового fetch
+        self._fetching_ip = None
 
         self._discovery = FgNetDiscovery(self._config.discovery_group,
                                          self._config.discovery_port)
@@ -715,17 +862,21 @@ class FgNetConfigDialog(QDialog):
         # -- выбор сигналов для записи ----------------------------------
         gb2 = QGroupBox('Сигналы для записи')
         gv2 = QVBoxLayout(gb2)
+        self._lbl_schema = QLabel()
+        self._lbl_schema.setStyleSheet('color:#888;')
+        gv2.addWidget(self._lbl_schema)
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
         self._tree.setSelectionMode(QAbstractItemView.NoSelection)
         self._tree.setUniformRowHeights(True)
         self._build_signal_tree(set(self._config.selected()))
+        self._update_schema_label()
         gv2.addWidget(self._tree)
         row = QHBoxLayout()
         b_none = QPushButton('Снять все')
         b_def = QPushButton('По умолчанию')
         b_none.clicked.connect(lambda: self._set_checks(set()))
-        b_def.clicked.connect(lambda: self._set_checks(set(FGNET_DEFAULT_CHANNELS)))
+        b_def.clicked.connect(lambda: self._set_checks(set(self._schema.default_channels())))
         row.addWidget(b_none)
         row.addWidget(b_def)
         row.addStretch()
@@ -746,29 +897,28 @@ class FgNetConfigDialog(QDialog):
         self._refresh.timeout.connect(self._refresh_list)
         self._refresh.start(500)
         self._discovery.send_request()
+        if self._config.device_ip:          # обновить схему известного устройства
+            self._request_schema(self._config.device_ip)
 
-    # -- дерево сигналов ------------------------------------------------
+    # -- дерево сигналов (строится из схемы) --------------------------
 
     def _build_signal_tree(self, checked: set[str]):
         self._tree.clear()
-
-        def add_group(title, rows):
+        for title, rows in self._schema.groups():
             grp = QTreeWidgetItem(self._tree, [title])
             grp.setFlags(Qt.ItemIsEnabled)
-            grp.setExpanded(True)
+            grp.setExpanded(title == self._schema.sys_group or 'сцил' in title)
             for key, label in rows:
                 it = QTreeWidgetItem(grp, [label])
                 it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
                 it.setData(0, Qt.UserRole, key)
                 it.setCheckState(0, Qt.Checked if key in checked else Qt.Unchecked)
 
-        add_group('Система (общий блок)',
-                  [(f'sys.{f}', lbl) for f, lbl in _SYS_LOG_FIELDS])
-        for n in range(1, 7):
-            add_group(f'Модуль {n}',
-                      [(f'dev{n}.{f}', lbl) for f, lbl in _DEV_LOG_FIELDS])
-        add_group('Осциллограф (61 точка/пакет, ~%d Гц)' % self._sb_rate.value(),
-                  _SCOPE_LOG)
+    def _update_schema_label(self):
+        if self._schema_from_device:
+            self._lbl_schema.setText('Схема каналов получена от устройства.')
+        else:
+            self._lbl_schema.setText('Схема каналов — встроенная (устройство не опрошено).')
 
     def _iter_leaves(self):
         for i in range(self._tree.topLevelItemCount()):
@@ -801,6 +951,21 @@ class FgNetConfigDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _refresh_list(self):
+        # применить схему, пришедшую из фонового fetch
+        if self._inbox_schema is not None:
+            ip, d = self._inbox_schema
+            self._inbox_schema = None
+            if ip == self._ed_ip.text().strip():
+                try:
+                    self._schema = FgNetSchema(d)
+                    self._schema_from_device = True
+                    keep = set(self._checked_keys()) or set(self._schema.default_channels())
+                    self._build_signal_tree(keep)
+                    self._update_schema_label()
+                    self._update_hint()
+                except Exception:
+                    pass
+
         devs = self._discovery.devices
         cur_ip = self._selected_ip()
         self._list.clear()
@@ -829,16 +994,34 @@ class FgNetConfigDialog(QDialog):
         if not it:
             return
         d = it.data(Qt.UserRole)
-        self._ed_ip.setText(d.get('ip', ''))
+        ip = d.get('ip', '')
+        self._ed_ip.setText(ip)
         if d.get('max_sample_rate'):
             self._sb_rate.setValue(int(d['max_sample_rate']))
+        self._request_schema(ip)
+
+    def _request_schema(self, ip: str):
+        """Фоновый GET_SCHEMA к устройству. Результат подхватит _refresh_list."""
+        if not ip or ip == self._fetching_ip:
+            return
+        self._fetching_ip = ip
+        cp = self._config.control_port
+
+        def work():
+            got = fetch_schema(ip, cp)
+            if got is not None:
+                self._inbox_schema = (ip, got)
+            self._fetching_ip = None
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------------
 
     def get_config(self) -> FgNetConfig:
         it = self._list.currentItem()
         dev_id = it.data(Qt.UserRole).get('device_id') if it else self._config.device_id
-        keys = self._checked_keys() or list(FGNET_DEFAULT_CHANNELS)
+        keys = self._checked_keys() or self._schema.default_channels()
+        schema = self._schema.to_dict() if self._schema_from_device else self._config.schema
         return FgNetConfig(
             device_id=dev_id,
             device_ip=self._ed_ip.text().strip(),
@@ -850,6 +1033,8 @@ class FgNetConfigDialog(QDialog):
             scope_scale=self._sb_scale.value(),
             telemetry_decim=self._sb_decim.value(),
             channels=keys,
+            schema=schema,
+            schema_crc=(zlib.crc32(json.dumps(schema).encode()) if schema else 0),
         )
 
     # то же имя, что у ComMCobsDialog — для единообразия вызова
