@@ -1,33 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""
+r"""
 PyInstaller spec для FlowerGraph.
 Сборка: cd FlowerGraph && .venv\Scripts\pyinstaller FlowerGraph.spec --clean
 """
 
-import os as _os
 from pathlib import Path as _Path
 
 from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
-# Номер сборки (4-я компонента версии). build_number.txt в .gitignore — этот
-# блок создаёт/обновляет его при каждой сборке и кладёт в дистрибутив (datas).
-#   CI (GitHub Actions): берём GITHUB_RUN_NUMBER (или FG_BUILD_NUMBER) как есть
-#   локально:            инкремент предыдущего значения
+# Версия задаётся целиком в ui/main_window.py::APP_VERSION (MAJOR.MINOR.PATCH.BUILD).
+# build_number.txt нужен только как фолбэк для старого 3-компонентного режима
+# _build_number(); держим файл в дистрибутиве (datas), не трогаем содержимое.
 _bn_path = _Path('build_number.txt')
-_env_bn = (_os.environ.get('FG_BUILD_NUMBER')
-           or _os.environ.get('GITHUB_RUN_NUMBER') or '').strip()
-if _env_bn:
-    _bn_path.write_text(_env_bn)
-    print(f'[spec] build_number.txt <- FG_BUILD_NUMBER {_env_bn}')
-else:
-    try:
-        _bn = int((_bn_path.read_text().strip() or '0')) + 1
-    except (OSError, ValueError):
-        _bn = 1
-    _bn_path.write_text(str(_bn))
-    print(f'[spec] build_number.txt -> {_bn}')
+if not _bn_path.exists():
+    _bn_path.write_text('0')
 
 # pyqtgraph: цветовые карты и шаблоны UI
 pyqtgraph_datas = collect_data_files('pyqtgraph')

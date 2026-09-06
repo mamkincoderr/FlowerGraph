@@ -56,13 +56,18 @@ from ui.com_ascii_dialog import ComAsciiDialog
 from core.i18n import tr, set_lang, get_lang
 
 APP_NAME    = 'FlowerGraph'
-APP_VERSION = '0.7.1'   # базовая версия — извлекается CI регуляркой, не менять формат
+# Полная версия MAJOR.MINOR.PATCH.BUILD — единственный источник истины.
+# Релиз: поднять последнюю компоненту, закоммитить, повесить тег v<APP_VERSION>
+# (`git tag v0.7.2.123 && git push origin v0.7.2.123`) — CI extract-version
+# вытащит её регуляркой, так назовёт артефакты и GitHub Release.
+APP_VERSION = '0.7.2.123'
 
 
 def _build_number() -> str:
-    """Номер сборки — 4-я компонента версии. В CI (GitHub Actions) берётся из
-    GITHUB_RUN_NUMBER, локально — из build_number.txt (инкрементит FlowerGraph.spec
-    при каждой PyInstaller-сборке). '0' если ничего не найдено."""
+    """Фолбэк-номер сборки для 3-компонентной APP_VERSION (старый режим): из env
+    FG_BUILD_NUMBER / GITHUB_RUN_NUMBER, иначе build_number.txt (инкрементит
+    FlowerGraph.spec). '0' если ничего не найдено. При 4-компонентной APP_VERSION
+    не используется."""
     n = (os.environ.get('FG_BUILD_NUMBER')
          or os.environ.get('GITHUB_RUN_NUMBER') or '').strip()
     if n:
@@ -80,8 +85,8 @@ def _build_number() -> str:
     return '0'
 
 
-APP_BUILD        = _build_number()
-APP_VERSION_FULL = f'{APP_VERSION}.{APP_BUILD}'
+APP_BUILD        = APP_VERSION.rsplit('.', 1)[-1] if APP_VERSION.count('.') >= 3 else _build_number()
+APP_VERSION_FULL = APP_VERSION if APP_VERSION.count('.') >= 3 else f'{APP_VERSION}.{APP_BUILD}'
 FILE_FILTER    = 'FlowerGraph Data (*.fgd);;Все файлы (*)'
 PGC_FILTER     = 'PGC (*.pgc);;Все файлы (*)'
 
