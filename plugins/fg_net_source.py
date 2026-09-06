@@ -327,6 +327,14 @@ class FgNetConfig:
     # Осциллограмма повторяется между захватами (+ независимо ~10-14 Гц по
     # завершению захвата). ВНИМАНИЕ: высокая частота нагружает HTTP устройства.
     telemetry_decim: int = 4
+    # Осциллограф мастера — это снимок ~30 мс, а не непрерывный поток; он
+    # обновляется ~7-14 Гц, между снимками 70-120 мс без данных. Если класть
+    # каждый снимок по его абсолютной метке времени, трасса стоит и рывками
+    # прыгает вперёд с большими пустотами (визуальный «лаг»). scope_stitch=True
+    # клеит захваты встык — пауза между снимками схлопывается, трасса непрерывна
+    # (как на штатном дисплее мастера). False — реальная временная шкала с
+    # пустотами. На режим логгера (без scope-каналов) не влияет.
+    scope_stitch:    bool = True
     # какие сигналы писать/строить. Ключи — sys.<k> / dev<N>.<k> / scope.<c>.
     channels:        list[str] = field(default_factory=lambda: list(FGNET_DEFAULT_CHANNELS))
     # последняя полученная от устройства схема тела пакета (GET_SCHEMA) + её CRC.
@@ -356,6 +364,7 @@ class FgNetConfig:
             'discovery_group': self.discovery_group,
             'scope_rate': self.scope_rate, 'scope_scale': self.scope_scale,
             'telemetry_decim': self.telemetry_decim,
+            'scope_stitch': self.scope_stitch,
             'channels': list(self.channels),
             'schema': self.schema, 'schema_crc': self.schema_crc,
         }
@@ -555,6 +564,7 @@ class FgNetSource(BaseSource):
         self._last_seq = -1
         self._last_scope_key = None
         self._t_offset_us = 0
+        self._scope_cursor = 0.0   # конец последнего склеенного окна scope (сек)
         self._sel = self._config.selected()   # зафиксировать на время сессии
         self._n_ch = len(self._sel)
 
@@ -624,6 +634,7 @@ class FgNetSource(BaseSource):
         self._last_seq = -1
         self._last_scope_key = None
         self._t_offset_us = 0
+        self._scope_cursor = 0.0
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
@@ -665,6 +676,7 @@ class FgNetSource(BaseSource):
 
         sch         = self._schema
         has_scope   = self._config.has_scope()
+        stitch      = self._config.scope_stitch
         scope_scale = self._config.scope_scale
         dt          = 1.0 / max(1, self._config.scope_rate)
         idx61       = np.arange(sch.scope_n, dtype=np.float64)
@@ -713,15 +725,24 @@ class FgNetSource(BaseSource):
                     continue
                 self._last_scope_key = scope_key
 
-            if self._t_offset_us == 0:
-                self._t_offset_us = hdr.timestamp_us
-            t0 = (hdr.timestamp_us - self._t_offset_us) / 1_000_000.0
-
             # scope выбран -> окно 61 точки (раскладка [канал][выборка], 3 блока
             # по 61), скаляры удерживаются постоянными. Иначе — один отсчёт на
             # пакет по метке времени (логгер, частота = темп пакетов).
             nrows = sch.scope_n if has_scope else 1
-            times = (t0 + idx61 * dt) if has_scope else np.array([t0], dtype=np.float64)
+
+            if has_scope and stitch:
+                # Клеим захваты встык: следующее окно начинается сразу за
+                # предыдущим. Паузы между снимками мастера (70-120 мс) убираются,
+                # трасса непрерывна — нет «лага»/рывков. Абсолютное время между
+                # захватами теряется (для осциллограммы это норма).
+                t0 = self._scope_cursor
+                self._scope_cursor = t0 + sch.scope_n * dt
+                times = t0 + idx61 * dt
+            else:
+                if self._t_offset_us == 0:
+                    self._t_offset_us = hdr.timestamp_us
+                t0 = (hdr.timestamp_us - self._t_offset_us) / 1_000_000.0
+                times = (t0 + idx61 * dt) if has_scope else np.array([t0], dtype=np.float64)
 
             values = np.empty((nrows, len(self._sel)), dtype=np.float32)
             for ci, key in enumerate(self._sel):
@@ -784,7 +805,8 @@ try:
     from PySide6.QtWidgets import (
         QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
         QPushButton, QListWidget, QListWidgetItem, QDialogButtonBox, QGroupBox,
-        QDoubleSpinBox, QSpinBox, QTreeWidget, QTreeWidgetItem, QAbstractItemView,
+        QDoubleSpinBox, QSpinBox, QCheckBox, QTreeWidget, QTreeWidgetItem,
+        QAbstractItemView,
     )
 except ImportError:  # headless (CI-тесты ставят только numpy) — диалог не создаётся
     class _NoQt:
@@ -793,7 +815,8 @@ except ImportError:  # headless (CI-тесты ставят только numpy) 
     QTimer = Qt = _NoQt()
     QDialog = QVBoxLayout = QHBoxLayout = QFormLayout = QLabel = QLineEdit = object
     QPushButton = QListWidget = QListWidgetItem = QDialogButtonBox = QGroupBox = object
-    QDoubleSpinBox = QSpinBox = QTreeWidget = QTreeWidgetItem = QAbstractItemView = object
+    QDoubleSpinBox = QSpinBox = QCheckBox = QTreeWidget = QTreeWidgetItem = object
+    QAbstractItemView = object
 
 
 class FgNetConfigDialog(QDialog):
@@ -846,6 +869,16 @@ class FgNetConfigDialog(QDialog):
         self._sb_scale.setToolTip('int16 → физические единицы. 0.1 — как в '
                                   'штатном осциллографе устройства; 1.0 — сырые отсчёты.')
         form.addRow('Масштаб scope:', self._sb_scale)
+
+        self._cb_stitch = QCheckBox('Склеивать захваты (убрать паузы)')
+        self._cb_stitch.setChecked(self._config.scope_stitch)
+        self._cb_stitch.setToolTip(
+            'Осциллограф устройства — снимок ~30 мс, обновляется ~7-14 Гц;\n'
+            'между снимками 70-120 мс без данных. Вкл: захваты клеятся встык,\n'
+            'трасса непрерывна (нет рывков/«лага»), но абсолютное время между\n'
+            'снимками теряется. Выкл: реальная шкала времени с пустотами.\n'
+            'На режим логгера (без scope-каналов) не влияет.')
+        form.addRow('', self._cb_stitch)
 
         self._sb_decim = QSpinBox()
         self._sb_decim.setRange(0, 255)
@@ -1032,6 +1065,7 @@ class FgNetConfigDialog(QDialog):
             scope_rate=self._sb_rate.value(),
             scope_scale=self._sb_scale.value(),
             telemetry_decim=self._sb_decim.value(),
+            scope_stitch=self._cb_stitch.isChecked(),
             channels=keys,
             schema=schema,
             schema_crc=(zlib.crc32(json.dumps(schema).encode()) if schema else 0),

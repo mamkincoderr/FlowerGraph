@@ -17,6 +17,7 @@ import numpy as np
 from plugins.fg_net_source import (
     FGNET_FMT_STRUCTURED_V1,
     FGNET_TYPE_DATA,
+    FgNetConfig,
     FgNetSchema,
     _DEFAULT_SCHEMA,
     _HDR_FMT,
@@ -164,6 +165,18 @@ class PacketTests(unittest.TestCase):
     def test_wrong_length_rejected(self):
         raw = self._packet(bytes(self.sc.body_size))
         self.assertIsNone(parse_packet(raw[:-1], self.sc))
+
+
+class ConfigTests(unittest.TestCase):
+    def test_scope_stitch_default_on_and_roundtrips(self):
+        self.assertTrue(FgNetConfig().scope_stitch)
+        d = FgNetConfig(scope_stitch=False).to_dict()
+        self.assertIs(d["scope_stitch"], False)
+        self.assertIs(FgNetConfig.from_dict(d).scope_stitch, False)
+
+    def test_has_scope(self):
+        self.assertTrue(FgNetConfig(channels=["scope.1"]).has_scope())
+        self.assertFalse(FgNetConfig(channels=["sys.U_in"]).has_scope())
 
 
 class AnnounceTests(unittest.TestCase):
