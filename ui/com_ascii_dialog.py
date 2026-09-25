@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QFrame
 )
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QFont, QColor, QFontMetrics
+from PySide6.QtGui import QFont, QColor, QFontDatabase, QFontMetrics
 
 from plugins.com_ascii_source import ComAsciiConfig
 
@@ -87,7 +87,7 @@ class ComAsciiDialog(QDialog):
     def __init__(self, config: ComAsciiConfig, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Источник данных — COM-ASCII')
-        self.setMinimumWidth(870)
+        self.setMinimumWidth(640)
         self.setMinimumHeight(460)
 
         self._config     = config
@@ -111,6 +111,7 @@ class ComAsciiDialog(QDialog):
         # ── Параметры порта ──────────────────────────────────────────
         grp = QGroupBox('Параметры порта')
         form = QFormLayout(grp)
+        self._port_form = form
         form.setSpacing(5)
         form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
@@ -125,6 +126,7 @@ class ComAsciiDialog(QDialog):
         btn_ref.setToolTip('Обновить список портов')
         btn_ref.clicked.connect(self._refresh_ports)
         port_row.addWidget(btn_ref)
+        self._cb_port.currentIndexChanged.connect(self._sync_ok)
         form.addRow('Порт:', port_row)
 
         # Скорость — выпадающий список
@@ -170,8 +172,9 @@ class ComAsciiDialog(QDialog):
         self._sb_ch.setRange(0, 32)
         self._sb_ch.setSpecialValueText('Авто')
         self._sb_ch.setFixedWidth(70)
+        self._sb_ch.setToolTip('0 — число каналов определится по первому пакету')
+        self._sb_ch.valueChanged.connect(lambda _v: self._update_baud_info(self.current_baudrate()))
         ch_row.addWidget(self._sb_ch)
-        ch_row.addWidget(QLabel('(0 = авто-определение по первому пакету)'))
         ch_row.addStretch()
         form.addRow('Каналов:', ch_row)
 
@@ -200,10 +203,8 @@ class ComAsciiDialog(QDialog):
         self._prev_txt = QTextEdit()
         self._prev_txt.setReadOnly(True)
         self._prev_txt.setMinimumHeight(140)
-        mono = QFont('Courier New')
-        mono.setPointSize(8)
+        mono = QFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self._prev_txt.setFont(mono)
-        self._prev_txt.setStyleSheet('background:#1c1c1c; color:#d4d4d4; border:1px solid #555;')
         btn_clr.clicked.connect(self._prev_txt.clear)
         pv.addWidget(self._prev_txt)
 
@@ -211,6 +212,7 @@ class ComAsciiDialog(QDialog):
 
         # ── Кнопки ────────────────────────────────────────────────────
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._btn_ok = bb.button(QDialogButtonBox.Ok)
         bb.accepted.connect(self._on_ok)
         bb.rejected.connect(self.reject)
         root.addWidget(bb)
@@ -305,7 +307,7 @@ class ComAsciiDialog(QDialog):
                 color    = _REL_COLOR.get(rel, '#888')
                 self._lbl_baud_info.setText(
                     f'<span style="color:{color}">CH32V303 @ 144МГц:{err_str}{ovs_note}'
-                    f'</span>  —  ~{pkt_rate:,} пакетов/с (4 канала)'
+                    f'</span>  —  ~{pkt_rate:,} пакетов/с ({n_ch_est} кан.)'
                 )
                 return
         # Нестандартная скорость
@@ -334,6 +336,7 @@ class ComAsciiDialog(QDialog):
             self._cb_port.addItem(desc, p.device)
         if not ports:
             self._cb_port.addItem('(нет доступных портов)', None)
+        self._sync_ok()
         # Восстанавливаем выбор
         restored = False
         for i in range(self._cb_port.count()):
@@ -456,13 +459,20 @@ class ComAsciiDialog(QDialog):
     # OK / Cancel
     # ------------------------------------------------------------------
 
+    def _sync_ok(self, *_args):
+        if hasattr(self, '_btn_ok'):
+            self._btn_ok.setEnabled(self._cb_port.currentData() is not None)
+
     def _on_ok(self):
+        if not self._cb_port.currentData():
+            return
         self._stop_preview()
         self.accept()
 
     def get_config(self) -> ComAsciiConfig:
+        port = self._cb_port.currentData() or ''
         return ComAsciiConfig(
-            port       = self._cb_port.currentData() or 'COM4',
+            port       = port,
             baudrate   = self.current_baudrate(),
             n_channels = self._sb_ch.value(),
         )

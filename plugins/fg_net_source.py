@@ -860,6 +860,10 @@ class FgNetConfigDialog(QDialog):
         self._sb_rate.setSuffix(' Гц')
         self._sb_rate.setToolTip('Частота дискретизации осциллографа на плате '
                                  'устройства (шкала времени графика).')
+        self._rate_user_set = False
+        self._rate_programmatic = False
+        self._picked_id = self._config.device_id
+        self._sb_rate.valueChanged.connect(self._on_rate_user)
         form.addRow('Частота scope:', self._sb_rate)
 
         self._sb_scale = QDoubleSpinBox()
@@ -977,6 +981,17 @@ class FgNetConfigDialog(QDialog):
 
     # ------------------------------------------------------------------
 
+    def _on_rate_user(self, *_args):
+        if self._rate_programmatic:
+            return
+        self._rate_user_set = True
+        self._update_hint()
+
+    def _set_rate(self, value: int):
+        self._rate_programmatic = True
+        self._sb_rate.setValue(int(value))
+        self._rate_programmatic = False
+
     def _refresh_list(self):
         # применить схему, пришедшую из фонового fetch
         if self._inbox_schema is not None:
@@ -994,20 +1009,35 @@ class FgNetConfigDialog(QDialog):
                     pass
 
         devs = self._discovery.devices
-        cur_ip = self._selected_ip()
-        self._list.clear()
-        rows = sorted(devs.values(), key=lambda x: x.get('ip', ''))
+        rows = sorted(devs.values(), key=lambda x: x.get('device_id', 0))
+        seen = set()
+        existing = {}
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            data = it.data(Qt.UserRole) or {}
+            existing[data.get('device_id')] = it
+        self._list.blockSignals(True)
         for d in rows:
+            dev_id = d.get('device_id')
+            seen.add(dev_id)
             label = (f"{d.get('name', '?')}   {d['ip']}   "
                      f"fw {d.get('fw', '?')}   "
                      f"{'стрим' if d.get('state') else 'ожидание'}")
-            it = QListWidgetItem(label)
-            it.setData(Qt.UserRole, d)
-            self._list.addItem(it)
-            if d['ip'] == cur_ip:
-                it.setSelected(True)
-        # одно устройство и поле IP пустое — выбрать автоматически
-        if len(rows) == 1 and not self._ed_ip.text().strip():
+            it = existing.get(dev_id)
+            if it is None:
+                it = QListWidgetItem(label)
+                it.setData(Qt.UserRole, d)
+                self._list.addItem(it)
+            else:
+                it.setText(label)
+                it.setData(Qt.UserRole, d)
+            if dev_id == self._picked_id:
+                self._list.setCurrentItem(it)
+        for dev_id, it in list(existing.items()):
+            if dev_id not in seen:
+                self._list.takeItem(self._list.row(it))
+        self._list.blockSignals(False)
+        if self._list.currentItem() is None and self._list.count() == 1 and not self._ed_ip.text().strip():
             self._list.setCurrentRow(0)
 
     def _selected_ip(self) -> str:
@@ -1022,9 +1052,10 @@ class FgNetConfigDialog(QDialog):
             return
         d = it.data(Qt.UserRole)
         ip = d.get('ip', '')
+        self._picked_id = d.get('device_id')
         self._ed_ip.setText(ip)
-        if d.get('max_sample_rate'):
-            self._sb_rate.setValue(int(d['max_sample_rate']))
+        if d.get('max_sample_rate') and not self._rate_user_set:
+            self._set_rate(int(d['max_sample_rate']))
         self._request_schema(ip)
 
     def _request_schema(self, ip: str):
@@ -1046,7 +1077,7 @@ class FgNetConfigDialog(QDialog):
 
     def get_config(self) -> FgNetConfig:
         it = self._list.currentItem()
-        dev_id = it.data(Qt.UserRole).get('device_id') if it else self._config.device_id
+        dev_id = it.data(Qt.UserRole).get('device_id') if it else self._picked_id
         keys = self._checked_keys() or self._schema.default_channels()
         schema = self._schema.to_dict() if self._schema_from_device else self._config.schema
         return FgNetConfig(

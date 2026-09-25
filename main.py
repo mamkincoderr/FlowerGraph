@@ -7,21 +7,16 @@ from pathlib import Path
 
 import pyqtgraph as pg
 from PySide6.QtWidgets import QApplication, QSplashScreen
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QPalette, QColor
 from PySide6.QtCore import Qt, QTimer
 from core.app_icon import app_icon
-from ui.main_window import MainWindow, APP_NAME
+from ui.main_window import MainWindow, APP_NAME, APP_VERSION
 
 pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
 pg.setConfigOption('antialias', True)
 
-try:
-    pg.setConfigOption('useOpenGL', True)
-except Exception:
-    pass
-
-_SPLASH_MS = 1500
+_SPLASH_MS = 300
 
 # В PyInstaller-сборке ресурсы лежат в sys._MEIPASS, при обычном запуске — рядом с main.py
 if getattr(sys, 'frozen', False):
@@ -129,7 +124,7 @@ def main():
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                'FlowerGraph.Desktop.0.6'
+                f'FlowerGraph.Desktop.{APP_VERSION}'
             )
         except Exception:
             pass
@@ -139,7 +134,32 @@ def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
+    use_gl = '--opengl' in sys.argv
+    try:
+        from core.config import config
+        use_gl = use_gl or bool(config.get('display', 'use_opengl', default=False))
+    except Exception:
+        pass
+    if use_gl:
+        try:
+            pg.setConfigOption('useOpenGL', True)
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor('#f3f3f3'))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor('#202020'))
+    palette.setColor(QPalette.ColorRole.Base, QColor('#ffffff'))
+    palette.setColor(QPalette.ColorRole.Text, QColor('#202020'))
+    palette.setColor(QPalette.ColorRole.Button, QColor('#e6e6e6'))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor('#202020'))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor('#0070c0'))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor('#ffffff'))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor('#ffffff'))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor('#202020'))
+    app.setPalette(palette)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName('FlowerGraph')
     icon = app_icon()
@@ -155,22 +175,16 @@ def main():
                 pixmap.width() // 2, pixmap.height() // 2,
                 Qt.KeepAspectRatio, Qt.SmoothTransformation,
             )
-            splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
+            splash = QSplashScreen(pixmap)
             splash.setWindowFlag(Qt.FramelessWindowHint)
             splash.show()
             app.processEvents()
 
     window = MainWindow()
-
-    def _finish():
-        window.show()
-        if splash:
-            splash.finish(window)
+    window.show()
 
     if splash:
-        QTimer.singleShot(_SPLASH_MS, _finish)
-    else:
-        window.show()
+        QTimer.singleShot(_SPLASH_MS, lambda: splash.finish(window))
 
     sys.exit(app.exec())
 

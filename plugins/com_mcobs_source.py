@@ -383,31 +383,28 @@ class ComMCobsDialog(ComCobsDialog):
         self._add_mcobs_widgets()
 
     def _add_mcobs_widgets(self):
-        from PySide6.QtWidgets import QGroupBox
-        for child in self.children():
-            if isinstance(child, QGroupBox) and 'орт' in (child.title() or ''):
-                form = child.layout()
-                if not isinstance(form, QFormLayout):
-                    continue
-
-                # Вставляем «Выборок в пакете» ПЕРЕД строкой COUNT (3 строки с конца)
-                batch_row = QHBoxLayout()
-                self._sb_batch = QSpinBox()
-                self._sb_batch.setRange(1, 64)
-                self._sb_batch.setValue(self._mcobs_config.batch_size)
-                self._sb_batch.setFixedWidth(70)
-                self._sb_batch.setToolTip(
-                    'N_COBS_BATCH в прошивке.\n'
-                    '1 = обычный COBS, 4 = рекомендуется, 8 = максимум'
-                )
-                self._sb_batch.valueChanged.connect(self._update_diagram)
-                batch_row.addWidget(self._sb_batch)
-                batch_row.addWidget(QLabel('(N_COBS_BATCH в прошивке)'))
-                batch_row.addStretch()
-
-                # COUNT, data_format, CRC — 3 последних строки → вставляем перед ними
-                form.insertRow(form.rowCount() - 3, 'Выборок в пакете:', batch_row)
-                break
+        form = getattr(self, '_port_form', None)
+        if not isinstance(form, QFormLayout):
+            return
+        batch_row = QHBoxLayout()
+        self._sb_batch = QSpinBox()
+        self._sb_batch.setRange(1, 64)
+        self._sb_batch.setValue(self._mcobs_config.batch_size)
+        self._sb_batch.setFixedWidth(70)
+        self._sb_batch.setToolTip(
+            'N_COBS_BATCH в прошивке.\n'
+            '1 = обычный COBS, 4 = рекомендуется, 8 = максимум'
+        )
+        self._sb_batch.valueChanged.connect(self._update_diagram)
+        self._sb_batch.valueChanged.connect(
+            lambda _v: self._update_baud_info(self.current_baudrate())
+        )
+        batch_row.addWidget(self._sb_batch)
+        batch_row.addWidget(QLabel('N_COBS_BATCH в прошивке'))
+        batch_row.addStretch()
+        form.insertRow(getattr(self, '_proto_insert_at', form.rowCount()),
+                       'Выборок в пакете:', batch_row)
+        self._update_baud_info(self.current_baudrate())
 
     def get_mcobs_config(self) -> ComMCobsConfig:
         cobs  = self.get_cobs_config()   # читает has_count, use_crc, data_format

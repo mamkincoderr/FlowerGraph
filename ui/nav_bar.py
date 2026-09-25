@@ -29,13 +29,16 @@ class NavBar(QWidget):
     go_end      = Signal()
     page_left   = Signal()
     page_right  = Signal()
-    zoom_in     = Signal()               # уменьшить время/дел
-    zoom_out    = Signal()               # увеличить время/дел
+    zoom_in     = Signal()               # приблизить: меньше время/дел
+    zoom_out    = Signal()               # отдалить: больше время/дел
     start_stop  = Signal()               # кнопка Старт/Стоп
+    prev_block  = Signal()
+    next_block  = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(68)
+        self.setFixedHeight(90)
+        self._dragging = False
 
         self._ov_curves: list[pg.PlotDataItem] = []
         self._block_lines: list[pg.InfiniteLine] = []
@@ -48,6 +51,12 @@ class NavBar(QWidget):
         for ln in self._region.lines:
             ln.setMovable(False)
         self._region.sigRegionChanged.connect(self._on_region_changed)
+        self._region.sigRegionChangeFinished.connect(self._on_drag_finished)
+        self._block_hi = pg.LinearRegionItem(
+            values=[0, 0], movable=False,
+            brush=pg.mkBrush(0, 140, 60, 35),
+            pen=pg.mkPen(None),
+        )
 
         self._build_ui()
 
@@ -62,7 +71,7 @@ class NavBar(QWidget):
 
         # --- Кнопки навигации ---
         nav = QWidget()
-        nav.setFixedWidth(100)
+        nav.setFixedWidth(148)
         nv = QVBoxLayout(nav)
         nv.setContentsMargins(0, 0, 0, 0)
         nv.setSpacing(2)
@@ -76,11 +85,15 @@ class NavBar(QWidget):
         self._btn_left  = self._nav_btn('◀',  'Предыдущая страница (PgUp)',   self.page_left)
         self._btn_right = self._nav_btn('▶',  'Следующая страница (PgDn)',    self.page_right)
         self._btn_end   = self._nav_btn('▶|', 'В конец блока (End)',          self.go_end)
+        self._btn_prev_b = self._nav_btn('◀◀', 'Предыдущий блок', self.prev_block)
+        self._btn_next_b = self._nav_btn('▶▶', 'Следующий блок', self.next_block)
 
         row1.addWidget(self._btn_start)
         row1.addWidget(self._btn_left)
+        row1.addWidget(self._btn_prev_b)
         row2.addWidget(self._btn_right)
         row2.addWidget(self._btn_end)
+        row2.addWidget(self._btn_next_b)
         nv.addLayout(row1)
         nv.addLayout(row2)
         outer.addWidget(nav)
@@ -108,11 +121,12 @@ class NavBar(QWidget):
         sv.setContentsMargins(0, 0, 0, 0)
         sv.setSpacing(2)
 
-        btn_zi = QPushButton('+')
-        btn_zi.setFixedHeight(20)
-        btn_zi.setToolTip('Приблизить (колесо вверх)')
-        btn_zi.clicked.connect(self.zoom_in)
-        sv.addWidget(btn_zi)
+        self._btn_zi = QPushButton('+')
+        self._btn_zi.setFixedHeight(20)
+        self._btn_zi.setFocusPolicy(Qt.NoFocus)
+        self._btn_zi.setToolTip('Приблизить: меньше время на деление')
+        self._btn_zi.clicked.connect(self.zoom_in)
+        sv.addWidget(self._btn_zi)
 
         self._lbl = QLabel('?')
         self._lbl.setAlignment(Qt.AlignCenter)
@@ -123,11 +137,12 @@ class NavBar(QWidget):
         )
         sv.addWidget(self._lbl)
 
-        btn_zo = QPushButton('−')
-        btn_zo.setFixedHeight(20)
-        btn_zo.setToolTip('Отдалить (колесо вниз)')
-        btn_zo.clicked.connect(self.zoom_out)
-        sv.addWidget(btn_zo)
+        self._btn_zo = QPushButton('−')
+        self._btn_zo.setFixedHeight(20)
+        self._btn_zo.setFocusPolicy(Qt.NoFocus)
+        self._btn_zo.setToolTip('Отдалить: больше время на деление')
+        self._btn_zo.clicked.connect(self.zoom_out)
+        sv.addWidget(self._btn_zo)
 
         outer.addWidget(scale_w)
 
@@ -140,13 +155,16 @@ class NavBar(QWidget):
             'QPushButton:hover { background:#1a7a34; }'
             'QPushButton:pressed { background:#155f28; }'
         )
+        self._btn_startstop.setFocusPolicy(Qt.NoFocus)
         self._btn_startstop.clicked.connect(self.start_stop)
         outer.addWidget(self._btn_startstop)
 
     @staticmethod
     def _nav_btn(text: str, tip: str, signal) -> QPushButton:
         b = QPushButton(text)
-        b.setFixedSize(46, 28)
+        b.setFixedSize(44, 26)
+        b.setFocusPolicy(Qt.NoFocus)
+        b.setAutoDefault(False)
         b.setToolTip(tip)
         b.clicked.connect(signal)
         return b
@@ -187,18 +205,31 @@ class NavBar(QWidget):
             color = colors[i % len(colors)]
             c = self._ov.plot(pen=pg.mkPen(color=color, width=1))
             self._ov_curves.append(c)
+        self._ov.addItem(self._block_hi)
         self._ov.addItem(self._region)
         for ln in self._region.lines:
             ln.setMovable(False)
 
+    def set_zoom_enabled(self, can_in: bool, can_out: bool):
+        self._btn_zi.setEnabled(can_in)
+        self._btn_zo.setEnabled(can_out)
+
+    def highlight_block(self, t0: float, t1: float):
+        self._block_hi.setRegion([t0, t1])
+
     def update_overview(self, times: np.ndarray, values: np.ndarray):
-        """Обновить кривые обзора (данные уже прорежены до MAX_OVERVIEW_PTS)."""
+        """Обновить кривые обзора. Пока регион тащат, ось X не сбрасывается."""
         if len(times) < 2:
             return
         for i, c in enumerate(self._ov_curves):
             if i < values.shape[1]:
                 c.setData(x=times, y=values[:, i])
-        self._ov.setXRange(float(times[0]), float(times[-1]), padding=0.01)
+        t0, t1 = float(times[0]), float(times[-1])
+        if not self._dragging:
+            self._ov.setXRange(t0, t1, padding=0.01)
+        self._region.blockSignals(True)
+        self._region.setBounds([t0, t1])
+        self._region.blockSignals(False)
 
     def set_view_region(self, t_min: float, t_max: float):
         """Сдвинуть выделенный регион без эмиссии сигнала navigate_to."""
@@ -227,7 +258,11 @@ class NavBar(QWidget):
 
     # ------------------------------------------------------------------
 
+    def _on_drag_finished(self):
+        self._dragging = False
+
     def _on_region_changed(self):
+        self._dragging = True
         r = self._region.getRegion()
         self.navigate_to.emit(float(r[0]), float(r[1]))
 

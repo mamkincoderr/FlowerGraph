@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import serial
 from PySide6.QtCore import QTimer, Qt, QRect
-from PySide6.QtGui  import QPainter, QPen, QColor, QFont, QBrush
+from PySide6.QtGui  import QPainter, QPen, QColor, QFont, QBrush, QFontDatabase
 from PySide6.QtWidgets import (
     QWidget, QGroupBox, QVBoxLayout, QHBoxLayout, QFormLayout,
     QCheckBox, QComboBox, QLabel, QSizePolicy,
@@ -123,7 +123,7 @@ class PacketDiagram(QWidget):
     _BOX_H   = 54     # высота поля
     _MIN_W   = 36     # минимальная ширина поля, px
     _MARGIN  = 8
-    _BG      = QColor('#1a1c2a')
+    _BG      = QColor('#f4f4f6')
 
     # Цвета полей
     _C_COUNT = QColor('#3d5fa8')
@@ -210,8 +210,10 @@ class PacketDiagram(QWidget):
                 idx = max(range(len(raw_ws)), key=lambda i: raw_ws[i])
                 raw_ws[idx] -= 1
 
-        fn_bold = QFont('Consolas', 8, QFont.Bold)
-        fn_small = QFont('Consolas', 7)
+        fixed = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        fn_bold = QFont(fixed)
+        fn_bold.setBold(True)
+        fn_small = QFont(fixed)
 
         x = MG
         for (name, sub, size, color), fw in zip(fields, raw_ws):
@@ -253,7 +255,7 @@ class PacketDiagram(QWidget):
         raw_total = total_b - 1   # без 0x00
         enc_approx = raw_total + 2
         p.setFont(fn_small)
-        p.setPen(QColor('#556'))
+        p.setPen(QColor('#333333'))
         p.drawText(MG, BY + BH + 12, f'raw: {raw_total} б   COBS+0x00: ~{enc_approx} б')
 
         p.end()
@@ -535,14 +537,9 @@ class ComCobsDialog(ComAsciiDialog):
     # ------------------------------------------------------------------
 
     def _add_cobs_widgets(self):
-        # --- 1. Найти GroupBox «Параметры порта» и добавить в его форму ---
-        for child in self.children():
-            if isinstance(child, QGroupBox) and 'орт' in (child.title() or ''):
-                form = child.layout()
-                if not isinstance(form, QFormLayout):
-                    continue
-                self._inject_proto_rows(form)
-                break
+        form = getattr(self, '_port_form', None)
+        if isinstance(form, QFormLayout):
+            self._inject_proto_rows(form)
 
         # --- 2. Вставить GroupBox «Структура пакета» между портом и превью ---
         grp_diag = QGroupBox('Структура пакета')
@@ -564,6 +561,7 @@ class ComCobsDialog(ComAsciiDialog):
 
     def _inject_proto_rows(self, form: QFormLayout):
         """Добавляет строки COUNT / тип данных / CRC в форму параметров порта."""
+        self._proto_insert_at = form.rowCount()
 
         # ── COUNT ──────────────────────────────────────────────────────
         self._chk_count = QCheckBox('Байт COUNT (uint8, детектор потерь)')
@@ -604,14 +602,32 @@ class ComCobsDialog(ComAsciiDialog):
             'Оба конца (MCU и PC) должны совпадать!'
         )
         self._chk_crc.toggled.connect(self._update_diagram)
+        self._chk_crc.toggled.connect(lambda _v: self._update_baud_info(self.current_baudrate()))
         form.addRow('', self._chk_crc)
 
-        # Каналы тоже влияют на диаграмму
         self._sb_ch.valueChanged.connect(self._update_diagram)
+        self._cb_format.currentIndexChanged.connect(
+            lambda _i: self._update_baud_info(self.current_baudrate())
+        )
+        self._update_baud_info(self.current_baudrate())
 
     # ------------------------------------------------------------------
     # Обновление диаграммы
     # ------------------------------------------------------------------
+
+    def _update_baud_info(self, baud: int):
+        n = self._sb_ch.value() or 1
+        fmt = self._cb_format.currentData() if hasattr(self, '_cb_format') else 'int16'
+        bps = _bps(fmt or 'int16')
+        batch = self._sb_batch.value() if hasattr(self, '_sb_batch') else 1
+        frame = 1 if hasattr(self, '_chk_count') and self._chk_count.isChecked() else 0
+        frame += n * bps * max(1, batch)
+        frame += 2 if hasattr(self, '_chk_crc') and self._chk_crc.isChecked() else 0
+        frame += 1
+        rate = int((baud or 0) / (max(frame, 1) * 10))
+        self._lbl_baud_info.setText(
+            f'~{rate:,} пакетов/с ({n} кан., кадр ~{frame} б)'
+        )
 
     def _update_diagram(self):
         if not hasattr(self, '_pkt_diagram'):
