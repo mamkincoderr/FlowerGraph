@@ -51,23 +51,17 @@ class RingBufferTests(unittest.TestCase):
         self.assertLess(float(np.min(lv)), -0.8)
 
     def test_zoom_out_stops_at_recorded_span(self):
-        from ui.plot_area import TIME_DIV_SEQ, max_div_idx_for_span, N_DIV
-        idx = max_div_idx_for_span(30.0)
-        self.assertLessEqual(TIME_DIV_SEQ[idx] * N_DIV, 30.0 * 1.02)
-        self.assertGreater(TIME_DIV_SEQ[idx + 1] * N_DIV, 30.0)
-
-    def test_zoom_out_stops_at_recorded_span(self):
-        from ui.plot_area import TIME_DIV_SEQ, max_div_idx_for_span, N_DIV
+        from core.timebase import TIME_DIV_SEQ, max_div_idx_for_span, N_DIV
         idx = max_div_idx_for_span(30.0)
         self.assertLessEqual(TIME_DIV_SEQ[idx] * N_DIV, 30.0 * 1.02)
         self.assertGreater(TIME_DIV_SEQ[idx + 1] * N_DIV, 30.0)
 
     def test_lod_keeps_the_last_sample(self):
-        from ui.plot_area import _lod_decimate
+        from core.timebase import lod_decimate
         n = 10_000
         t = np.linspace(0, 5, n)
         v = np.column_stack([np.sin(2 * np.pi * 3 * t), np.cos(t)]).astype(np.float32)
-        td, vd = _lod_decimate(t, v, 8000)
+        td, vd = lod_decimate(t, v, 8000)
         self.assertAlmostEqual(float(td[0]), float(t[0]), places=6)
         self.assertAlmostEqual(float(td[-1]), float(t[-1]), places=6)
         self.assertLessEqual(len(td), 8000)
