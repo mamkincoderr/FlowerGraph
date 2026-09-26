@@ -22,9 +22,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
-from core.measure import index_range
 from core.session import Block
-from ui.fonts import ui_font
 
 
 # ---------------------------------------------------------------------------
@@ -63,17 +61,15 @@ class ExportCsvDialog(QDialog):
         self._bg_src.addButton(self._rb_all,  0)
         self._bg_src.addButton(self._rb_view, 1)
         self._rb_all.setChecked(True)
-        self._rb_all.toggled.connect(self._update_row_count)
-        self._rb_view.toggled.connect(self._update_row_count)
         src_v.addWidget(self._rb_all)
         src_v.addWidget(self._rb_view)
 
         if self._view_range:
             t0, t1 = self._view_range
-            i0, i1 = index_range(self._block.times, t0, t1)
-            n_vis = i1 - i0
+            n_vis = int(np.searchsorted(self._block.times, t1)) \
+                  - int(np.searchsorted(self._block.times, t0))
             lbl = QLabel(f'    ({n_vis:,} отсчётов,  {t1-t0:.4g} с)')
-            lbl.setFont(ui_font(-1))
+            lbl.setStyleSheet('color:#555; font-size:9px;')
             src_v.addWidget(lbl)
 
         root.addWidget(grp_src)
@@ -96,20 +92,11 @@ class ExportCsvDialog(QDialog):
         ch_v.addLayout(sel_h)
 
         self._ch_boxes: list[QCheckBox] = []
-        ch_host = QWidget()
-        ch_host_l = QVBoxLayout(ch_host)
-        ch_host_l.setContentsMargins(0, 0, 0, 0)
         for i, ch in enumerate(self._block.channels):
             cb = QCheckBox(f'CH{i+1}: {ch.name}' if ch.name != f'CH{i+1}' else f'CH{i+1}')
             cb.setChecked(True)
-            cb.toggled.connect(self._sync_ok)
-            ch_host_l.addWidget(cb)
+            ch_v.addWidget(cb)
             self._ch_boxes.append(cb)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(ch_host)
-        scroll.setMaximumHeight(180)
-        ch_v.addWidget(scroll)
 
         root.addWidget(grp_ch)
 
@@ -130,7 +117,7 @@ class ExportCsvDialog(QDialog):
         dec_form.addRow('', dec_h)
 
         self._lbl_rows = QLabel()
-        self._lbl_rows.setFont(ui_font(-1))
+        self._lbl_rows.setStyleSheet('color:#555; font-size:9px;')
         dec_form.addRow('', self._lbl_rows)
         self._update_row_count()
 
@@ -183,33 +170,16 @@ class ExportCsvDialog(QDialog):
 
         # ── Кнопки ───────────────────────────────────────────────────
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self._btn_ok = bb.button(QDialogButtonBox.Ok)
-        self._btn_ok.setText('Сохранить…')
+        bb.button(QDialogButtonBox.Ok).setText('Сохранить…')
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         root.addWidget(bb)
-        self._sync_ok()
 
     # ------------------------------------------------------------------
 
     def _set_all_channels(self, state: bool):
         for cb in self._ch_boxes:
             cb.setChecked(state)
-        self._sync_ok()
-
-    def _sync_ok(self, *_args):
-        if hasattr(self, '_btn_ok'):
-            self._btn_ok.setEnabled(any(cb.isChecked() for cb in self._ch_boxes))
-
-    def accept(self):
-        if not any(cb.isChecked() for cb in self._ch_boxes):
-            return
-        if self._rb_comma.isChecked() and self._cb_sep.currentData() == ',':
-            for i in range(self._cb_sep.count()):
-                if self._cb_sep.itemData(i) == ';':
-                    self._cb_sep.setCurrentIndex(i)
-                    break
-        super().accept()
 
     def _on_decimal_changed(self, comma_checked: bool):
         # При выборе запятой как десятичного — переключить разделитель на ;
@@ -224,8 +194,9 @@ class ExportCsvDialog(QDialog):
         total = self._block.n_samples
         if self._view_range and self._rb_view.isChecked():
             t0, t1 = self._view_range
-            i0, i1 = index_range(self._block.times, t0, t1)
-            total = i1 - i0
+            n0 = int(np.searchsorted(self._block.times, t0))
+            n1 = int(np.searchsorted(self._block.times, t1))
+            total = n1 - n0
         rows = max(1, (total + step - 1) // step)
         self._lbl_rows.setText(
             f'Будет записано: {rows:,} строк'
@@ -265,8 +236,10 @@ def export_csv(block: Block,
     # Диапазон
     if settings['range'] == 'view' and view_range:
         t0, t1   = view_range
-        i0, i1 = index_range(t, t0, t1)
-        t, v = t[i0:i1], v[i0:i1]
+        i0       = int(np.searchsorted(t, t0))
+        i1       = int(np.searchsorted(t, t1)) + 1
+        i0, i1   = max(0, i0), min(len(t), i1)
+        t, v     = t[i0:i1], v[i0:i1]
 
     # Прореживание
     step = max(1, settings['decimation'])

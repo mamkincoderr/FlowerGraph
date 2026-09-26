@@ -1,155 +1,144 @@
-"""Статистика выделения: среднее, СКО, RMS, минимум, максимум, размах, число точек."""
+"""
+StatsPanel — панель статистики по выделенному сегменту.
 
+Показывает для каждого канала: среднее, СКО, максимум, минимум.
+"""
+
+import math
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QSize
-from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton, QSizePolicy,
-    QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QFrame, QScrollArea
 )
-
-from core.measure import fragment_stats
-from ui.fonts import mono_font, ui_font
-
-_COLUMNS = ('Канал', 'Ср.', 'СКО', 'RMS', 'Мин', 'Макс', 'Размах', 'N')
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 
 
 class StatsPanel(QWidget):
-    collapsed_changed = Signal(bool)
-
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._names: list[str] = []
-        self._colors: list[str] = []
-        self._collapsed = False
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.setMinimumHeight(60)
+        self.setMaximumHeight(220)
         self._build_ui()
-
-    def sizeHint(self):
-        return QSize(640, 120)
+        self._rows: list[_StatRow] = []
 
     def _build_ui(self):
         vl = QVBoxLayout(self)
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(0)
 
-        hdr = QWidget()
-        hdr.setObjectName('statsHeader')
-        hdr.setAttribute(Qt.WA_StyledBackground, True)
-        hdr.setStyleSheet('#statsHeader { background:#e8e8e8; }')
-        hl = QHBoxLayout(hdr)
-        hl.setContentsMargins(4, 2, 4, 2)
-        self._btn = QPushButton('▼  Статистика')
-        self._btn.setFlat(True)
-        self._btn.setFont(ui_font(0))
-        self._btn.setFocusPolicy(Qt.NoFocus)
-        self._btn.clicked.connect(self.toggle)
-        hl.addWidget(self._btn)
-        hl.addStretch()
-        self._btn_copy = QPushButton('Копировать')
-        self._btn_copy.setFocusPolicy(Qt.NoFocus)
-        self._btn_copy.setFont(ui_font(-1))
-        self._btn_copy.clicked.connect(self.copy_to_clipboard)
-        hl.addWidget(self._btn_copy)
+        hdr = QLabel('  Статистика фрагмента')
+        hdr.setStyleSheet(
+            'background:#e8e8e8; font-weight:bold; padding:3px 4px;'
+            'border-top:1px solid #ccc; font-size:11px;'
+        )
         vl.addWidget(hdr)
 
-        self._stack = QStackedWidget()
-        self._empty = QLabel('Нет выделения')
-        self._empty.setFont(ui_font(-1))
-        self._empty.setStyleSheet('color:#666; padding:6px;')
-        self._table = QTableWidget(0, len(_COLUMNS))
-        self._table.setHorizontalHeaderLabels(list(_COLUMNS))
-        self._table.verticalHeader().setVisible(False)
-        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._table.setSelectionMode(QTableWidget.NoSelection)
-        self._table.setFocusPolicy(Qt.NoFocus)
-        self._table.setFont(mono_font(-1))
-        self._table.horizontalHeader().setFont(ui_font(-1))
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self._stack.addWidget(self._empty)
-        self._stack.addWidget(self._table)
-        vl.addWidget(self._stack)
-        self._body = self._stack
+        # Заголовок колонок
+        col_hdr = QWidget()
+        ch = QHBoxLayout(col_hdr)
+        ch.setContentsMargins(4, 1, 4, 1)
+        ch.setSpacing(0)
+        for txt, w in [('', 16), ('Кан.', 36), ('Ср.', 62), ('СКО', 62), ('Мин', 55), ('Макс', 55)]:
+            l = QLabel(txt)
+            l.setFixedWidth(w)
+            l.setStyleSheet('font-size:9px; color:#666;')
+            l.setAlignment(Qt.AlignCenter)
+            ch.addWidget(l)
+        col_hdr.setStyleSheet('background:#f4f4f4;')
+        vl.addWidget(col_hdr)
 
-    def toggle(self):
-        self.set_collapsed(not self._collapsed)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet('color:#ddd;')
+        vl.addWidget(sep)
 
-    def set_collapsed(self, collapsed: bool):
-        self._collapsed = collapsed
-        self._body.setVisible(not collapsed)
-        self._btn.setText(('▶' if collapsed else '▼') + '  Статистика')
-        self.collapsed_changed.emit(collapsed)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        vl.addWidget(self._scroll)
+
+        self._lbl_empty = QLabel('  Нет выделения')
+        self._lbl_empty.setStyleSheet('color:#aaa; font-size:10px; padding:4px;')
+        self._scroll.setWidget(self._lbl_empty)
 
     def setup(self, names: list[str], colors: list[str]):
-        self._names = list(names)
-        self._colors = list(colors)
-        self._table.setRowCount(0)
-        self.show_empty()
+        self._rows.clear()
+        container = QWidget()
+        vl = QVBoxLayout(container)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
+        for i, (name, color) in enumerate(zip(names, colors)):
+            r = _StatRow(i, name, color)
+            vl.addWidget(r)
+            self._rows.append(r)
+        vl.addStretch()
+        self._scroll.setWidget(container)
 
-    def show_empty(self):
-        self._table.setRowCount(0)
-        self._stack.setCurrentWidget(self._empty)
+    def update_stats(self, channel_data: list[np.ndarray | None], units: list[str]):
+        """
+        channel_data: список из np.ndarray (1D) или None для каждого канала.
+        units:        список единиц измерения.
+        """
+        for i, row in enumerate(self._rows):
+            u = units[i] if i < len(units) else ''
+            if i < len(channel_data) and channel_data[i] is not None:
+                row.update(channel_data[i], u)
+            else:
+                row.clear()
 
     def clear(self):
-        self.show_empty()
+        for r in self._rows:
+            r.clear()
 
-    def update_stats(self, channel_data: list[np.ndarray | None], units: list[str],
-                     visible: list[bool] | None = None):
-        rows = []
-        for i, data in enumerate(channel_data):
-            if visible is not None and i < len(visible) and not visible[i]:
-                continue
-            if data is None:
-                continue
-            st = fragment_stats(np.asarray(data))
-            if st is None:
-                continue
-            name = self._names[i] if i < len(self._names) else f'CH{i + 1}'
-            unit = units[i] if i < len(units) else ''
-            rows.append((i, name, unit, st))
-        if not rows:
-            self.show_empty()
-            return
-        unit0 = rows[0][2]
-        headers = list(_COLUMNS)
-        if unit0:
-            for col in (1, 2, 3, 4, 5, 6):
-                headers[col] = f'{_COLUMNS[col]} ({unit0})'
-        self._table.setHorizontalHeaderLabels(headers)
-        self._table.setRowCount(len(rows))
-        for r, (idx, name, _unit, st) in enumerate(rows):
-            vals = (
-                name,
-                f'{st["mean"]:.4g}',
-                f'{st["std"]:.4g}',
-                f'{st["rms"]:.4g}',
-                f'{st["min"]:.4g}',
-                f'{st["max"]:.4g}',
-                f'{st["pp"]:.4g}',
-                str(st['n']),
-            )
-            for c, text in enumerate(vals):
-                item = QTableWidgetItem(text)
-                if c == 0 and idx < len(self._colors):
-                    item.setForeground(Qt.black)
-                    item.setToolTip(self._colors[idx])
-                self._table.setItem(r, c, item)
-        self._stack.setCurrentWidget(self._table)
 
-    def copy_to_clipboard(self):
-        if self._table.rowCount() == 0:
+class _StatRow(QWidget):
+    def __init__(self, idx: int, name: str, color: str, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(20)
+        lo = QHBoxLayout(self)
+        lo.setContentsMargins(4, 0, 4, 0)
+        lo.setSpacing(0)
+
+        dot = QLabel('▌')
+        dot.setStyleSheet(f'color:{color}; font-size:12px;')
+        dot.setFixedWidth(16)
+        lo.addWidget(dot)
+
+        lbl = QLabel(name[:5])
+        lbl.setFixedWidth(36)
+        lbl.setStyleSheet('font-size:10px;')
+        lo.addWidget(lbl)
+
+        mono = QFont('Courier New', 8)
+        self._lbls = []
+        for w in (62, 62, 55, 55):
+            l = QLabel('—')
+            l.setFixedWidth(w)
+            l.setFont(mono)
+            l.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            l.setStyleSheet('font-size:9px; padding-right:3px;')
+            lo.addWidget(l)
+            self._lbls.append(l)
+
+    def update(self, data: np.ndarray, unit: str):
+        if len(data) == 0:
+            self.clear()
             return
-        headers = [
-            self._table.horizontalHeaderItem(c).text()
-            for c in range(self._table.columnCount())
-        ]
-        lines = ['\t'.join(headers)]
-        for r in range(self._table.rowCount()):
-            cells = []
-            for c in range(self._table.columnCount()):
-                item = self._table.item(r, c)
-                cells.append(item.text() if item else '')
-            lines.append('\t'.join(cells))
-        QGuiApplication.clipboard().setText('\n'.join(lines))
+        mean = float(np.mean(data))
+        rms  = float(np.sqrt(np.mean(data ** 2)))
+        mn   = float(np.min(data))
+        mx   = float(np.max(data))
+        u    = f' {unit}' if unit else ''
+        self._lbls[0].setText(f'{mean:.4g}{u}')
+        self._lbls[1].setText(f'{rms:.4g}{u}')
+        self._lbls[2].setText(f'{mn:.4g}')
+        self._lbls[3].setText(f'{mx:.4g}')
+        # Подсветить строку
+        self.setStyleSheet('background:#fffbe6;')
+
+    def clear(self):
+        for l in self._lbls:
+            l.setText('—')
+        self.setStyleSheet('')

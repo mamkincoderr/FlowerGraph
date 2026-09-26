@@ -79,7 +79,6 @@ class ChannelCalibDialog(QDialog):
         fl2.addRow('', self._lbl_preview)
         self._sb_coeff.valueChanged.connect(self._update_preview)
         self._sb_offset.valueChanged.connect(self._update_preview)
-        self._cb_unit.currentTextChanged.connect(self._update_preview)
         vl.addWidget(grp_ab)
 
         # --- Калибровка по двум точкам ---
@@ -95,8 +94,8 @@ class ChannelCalibDialog(QDialog):
             h = QHBoxLayout(w)
             h.setContentsMargins(0, 0, 0, 0)
             h.addWidget(QLabel(label))
-            raw_sb = _dsb(0, -1e15, 1e15, 8)
-            phy_sb = _dsb(0, -1e15, 1e15, 8)
+            raw_sb = _dsb(0, -1e15, 1e15, 4)
+            phy_sb = _dsb(0, -1e15, 1e15, 4)
             h.addWidget(QLabel('raw ='))
             h.addWidget(raw_sb)
             h.addWidget(QLabel('→ phys ='))
@@ -118,7 +117,7 @@ class ChannelCalibDialog(QDialog):
         btn_reset.clicked.connect(self._reset_calib)
 
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bbox.accepted.connect(self._accept)
+        bbox.accepted.connect(self.accept)
         bbox.rejected.connect(self.reject)
 
         h_bot = QHBoxLayout()
@@ -154,12 +153,6 @@ class ChannelCalibDialog(QDialog):
         self._sb_offset.setValue(0.0)
 
     # --- Результат ---
-
-    def _accept(self):
-        if not self._ed_name.text().strip():
-            QMessageBox.warning(self, 'Калибровка', 'Имя канала не может быть пустым.')
-            return
-        self.accept()
 
     def get_name(self) -> str:
         return self._ed_name.text().strip()

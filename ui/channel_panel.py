@@ -1,259 +1,267 @@
-"""Одна таблица каналов: видимость, имя, значение, цена деления, смещение."""
-
 import math
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFontMetrics
+import numpy as np
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QCheckBox, QDoubleSpinBox, QPushButton, QComboBox,
+    QScrollArea, QFrame, QSizePolicy
 )
+from PySide6.QtCore import Signal, Qt, QPointF, QSize
+from PySide6.QtGui import QPixmap, QColor, QIcon, QPainter, QPen
 
-from core.channel_state import ChannelState
-from core.measure import parse_y_text
-from ui.fonts import mono_font, ui_font
 from ui.plot_area import Y_DIV_SEQ, fmt_y_div
 
+# Цвет, Канал, галочка, Y/дел, смещение, A, калибровка.
+# Y/дел чуть шире 46: слово и цифра садятся левее штатной стрелки, не обрезаясь.
+_COLS = (18, 64, 28, 54, 88, 28, 28)
+_ARROW_W = 16
+_ROW_H = 26
 
-def _nofocus(btn: QPushButton):
-    btn.setFocusPolicy(Qt.NoFocus)
-    btn.setAutoDefault(False)
-    return btn
+
+def _gear_pixmap(px: int = 15) -> QPixmap:
+    """Чёрная шестерёнка. Символ ⚙ в системном шрифте рисуется бледным кружком."""
+    img = QPixmap(px, px)
+    img.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(img)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor('#222222'))
+    pen.setWidthF(1.3)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    c = px / 2.0
+    painter.drawEllipse(QPointF(c, c), px * 0.16, px * 0.16)
+    painter.drawEllipse(QPointF(c, c), px * 0.30, px * 0.30)
+    for i in range(8):
+        a = math.radians(i * 45)
+        painter.drawLine(
+            QPointF(c + math.cos(a) * px * 0.32, c + math.sin(a) * px * 0.32),
+            QPointF(c + math.cos(a) * px * 0.46, c + math.sin(a) * px * 0.46),
+        )
+    painter.end()
+    return img
+
+
+def _vgrid() -> QFrame:
+    line = QFrame()
+    line.setFixedWidth(1)
+    line.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+    line.setStyleSheet('background: #c8c8c8;')
+    return line
 
 
 class ChannelRow(QWidget):
-    sig_visibility = Signal(int, bool)
-    sig_scale = Signal(int, float)          # цена деления, физ. ед./дел
-    sig_offset = Signal(int, float)
-    sig_auto = Signal(int)
-    sig_calib_requested = Signal(int)
-    sig_activated = Signal(int)
+    sig_visibility      = Signal(int, bool)
+    sig_scale           = Signal(int, float)   # idx, y_div (scale multiplier)
+    sig_offset          = Signal(int, float)
+    sig_auto            = Signal(int)
+    sig_calib_requested = Signal(int)          # пользователь нажал ⚙ для канала idx
 
     def __init__(self, idx: int, name: str, color: str, parent=None):
         super().__init__(parent)
         self._idx = idx
         self._unit = ''
-        self._full_name = name
-        self._active = False
-        self.setObjectName('chRow')
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setMinimumHeight(28)
-        self.setCursor(Qt.PointingHandCursor)
         self._build(name, color)
-        self._update_bg()
 
     def _build(self, name: str, color: str):
+        self.setFixedHeight(_ROW_H + 4)
         row = QHBoxLayout(self)
-        row.setContentsMargins(4, 1, 4, 1)
-        row.setSpacing(4)
+        row.setContentsMargins(4, 2, 4, 2)
+        row.setSpacing(0)
 
-        self._dot = QLabel('▌')
-        self._dot.setStyleSheet(f'color:{color};')
-        self._dot.setFont(ui_font(1))
-        self._dot.setFixedWidth(14)
-        row.addWidget(self._dot)
+        swatch = QPixmap(10, 10)
+        swatch.fill(QColor(color))
+        dot = QLabel()
+        dot.setPixmap(swatch)
+        dot.setFixedWidth(_COLS[0])
+        dot.setAlignment(Qt.AlignCenter)
+
+        self._lbl_name = QLabel(name)
+        self._lbl_name.setMinimumWidth(_COLS[1])
+        self._lbl_name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._lbl_name.setToolTip(name)
 
         self._cb = QCheckBox()
         self._cb.setChecked(True)
-        self._cb.setFocusPolicy(Qt.NoFocus)
+        self._cb.setFixedWidth(_COLS[2])
+        self._cb.setFixedHeight(_ROW_H)
+        self._cb.setStyleSheet(
+            'QCheckBox { padding-left: 7px; spacing: 0; }'
+            'QCheckBox::indicator { width: 13px; height: 13px; }'
+        )
         self._cb.setToolTip('Показать или скрыть канал')
-        self._cb.toggled.connect(self._on_visible)
-        row.addWidget(self._cb)
-
-        self._lbl_name = QLabel(name)
-        self._lbl_name.setFont(ui_font(-1))
-        self._lbl_name.setMinimumWidth(48)
-        self._lbl_name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        row.addWidget(self._lbl_name, stretch=2)
-
-        self._val = QLabel('—')
-        self._val.setFont(mono_font(-1))
-        self._val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self._val.setMinimumWidth(64)
-        row.addWidget(self._val, stretch=1)
+        self._cb.toggled.connect(lambda v: self.sig_visibility.emit(self._idx, v))
 
         self._cb_ydiv = QComboBox()
         self._cb_ydiv.setEditable(True)
-        self._cb_ydiv.setInsertPolicy(QComboBox.NoInsert)
-        self._cb_ydiv.setFocusPolicy(Qt.ClickFocus)
-        self._cb_ydiv.setMinimumWidth(72)
-        self._cb_ydiv.setFont(ui_font(-1))
-        self._cb_ydiv.setToolTip('Цена деления по Y, физические единицы на клетку')
+        self._cb_ydiv.setMinimumContentsLength(1)
+        self._cb_ydiv.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
         for v in Y_DIV_SEQ:
             self._cb_ydiv.addItem(fmt_y_div(v), v)
         self._cb_ydiv.setCurrentIndex(Y_DIV_SEQ.index(1.0))
-        self._cb_ydiv.activated.connect(self._emit_ydiv)
-        self._cb_ydiv.lineEdit().editingFinished.connect(self._emit_ydiv)
-        row.addWidget(self._cb_ydiv)
+        self._cb_ydiv.setFixedWidth(_COLS[3])
+        self._cb_ydiv.setFixedHeight(_ROW_H)
+        self._cb_ydiv.setToolTip('Цена деления по Y')
+        edit = self._cb_ydiv.lineEdit()
+        edit.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        edit.setMinimumWidth(0)
+        self._cb_ydiv.currentIndexChanged.connect(self._on_ydiv_combo)
+        edit.editingFinished.connect(self._on_ydiv_edit)
 
-        self._lbl_unit = QLabel('')
-        self._lbl_unit.setFont(ui_font(-1))
-        self._lbl_unit.setMinimumWidth(24)
-        row.addWidget(self._lbl_unit)
-        self.set_name(name)
-
-        from PySide6.QtWidgets import QDoubleSpinBox
         self._sb_offset = QDoubleSpinBox()
         self._sb_offset.setRange(-1e9, 1e9)
-        self._sb_offset.setDecimals(3)
         self._sb_offset.setSingleStep(0.1)
+        self._sb_offset.setDecimals(3)
         self._sb_offset.setValue(0.0)
-        self._sb_offset.setPrefix('+')
-        self._sb_offset.setMinimumWidth(72)
-        self._sb_offset.setFocusPolicy(Qt.ClickFocus)
-        self._sb_offset.setToolTip('Вертикальное смещение, в делениях после масштаба')
-        self._sb_offset.valueChanged.connect(lambda v: self.sig_offset.emit(self._idx, float(v)))
-        row.addWidget(self._sb_offset)
+        self._sb_offset.setFixedWidth(_COLS[4])
+        self._sb_offset.setFixedHeight(_ROW_H)
+        self._sb_offset.setAlignment(Qt.AlignRight)
+        self._sb_offset.setToolTip('Вертикальное смещение')
+        self._sb_offset.valueChanged.connect(lambda v: self.sig_offset.emit(self._idx, v))
 
-        btn_auto = _nofocus(QPushButton('A'))
-        btn_auto.setFixedWidth(26)
-        btn_auto.setToolTip('Авто-масштаб по текущим данным')
+        btn_auto = QPushButton('A')
+        btn_auto.setFixedWidth(_COLS[5])
+        btn_auto.setFixedHeight(_ROW_H)
+        btn_auto.setStyleSheet('QPushButton { padding: 0; color: #222; }')
+        btn_auto.setToolTip('Вписать канал в текущий экран')
         btn_auto.clicked.connect(lambda: self.sig_auto.emit(self._idx))
-        row.addWidget(btn_auto)
 
-        btn_cal = _nofocus(QPushButton('⚙'))
-        btn_cal.setFixedWidth(26)
+        btn_cal = QPushButton()
+        btn_cal.setIcon(QIcon(_gear_pixmap()))
+        btn_cal.setIconSize(QSize(15, 15))
+        btn_cal.setFixedWidth(_COLS[6])
+        btn_cal.setFixedHeight(_ROW_H)
+        btn_cal.setStyleSheet('QPushButton { padding: 0; }')
         btn_cal.setToolTip('Калибровка канала')
         btn_cal.clicked.connect(lambda: self.sig_calib_requested.emit(self._idx))
-        row.addWidget(btn_cal)
 
-    def _on_visible(self, visible: bool):
-        self.sig_visibility.emit(self._idx, bool(visible))
-        self.sig_activated.emit(self._idx)
+        for widget in (dot, self._lbl_name, self._cb, self._cb_ydiv,
+                       self._sb_offset, btn_auto, btn_cal):
+            row.addWidget(_vgrid())
+            row.addWidget(widget)
+        row.addWidget(_vgrid())
 
-    def _emit_ydiv(self):
-        if self._cb_ydiv.signalsBlocked():
-            return
-        text = self._cb_ydiv.currentText()
+    # --- обработчики Y_DIV ---
+
+    def _on_ydiv_combo(self, idx):
+        v = self._cb_ydiv.currentData()
+        if v is not None:
+            self.sig_scale.emit(self._idx, float(v))
+
+    def _on_ydiv_edit(self):
         try:
-            value = parse_y_text(text)
+            v = float(self._cb_ydiv.currentText().replace(',', '.').replace('k', 'e3').replace('m', 'e-3'))
+            self.sig_scale.emit(self._idx, v)
         except ValueError:
-            data = self._cb_ydiv.currentData()
-            if data is None:
-                return
-            value = float(data)
-        if not math.isfinite(value) or value == 0.0:
-            return
-        self.sig_activated.emit(self._idx)
-        self.sig_scale.emit(self._idx, float(value))
+            pass
 
-    def set_y_per_div(self, value: float):
+    # --- обновление из кода без эмиссии сигналов ---
+
+    def set_scale(self, v: float):
         self._cb_ydiv.blockSignals(True)
-        best = min(range(len(Y_DIV_SEQ)), key=lambda i: abs(Y_DIV_SEQ[i] - value))
-        if abs(Y_DIV_SEQ[best] - value) / max(abs(value), 1e-15) < 0.01:
-            self._cb_ydiv.setCurrentIndex(best)
-        else:
-            self._cb_ydiv.setCurrentText(fmt_y_div(value))
+        # Поиск ближайшего в Y_DIV_SEQ
+        try:
+            best = min(range(len(Y_DIV_SEQ)), key=lambda i: abs(Y_DIV_SEQ[i] - v))
+            if abs(Y_DIV_SEQ[best] - v) / max(abs(v), 1e-15) < 0.01:
+                self._cb_ydiv.setCurrentIndex(best)
+            else:
+                self._cb_ydiv.setCurrentText(fmt_y_div(v))
+        except Exception:
+            pass
         self._cb_ydiv.blockSignals(False)
 
-    def set_offset(self, value: float):
+    def set_offset(self, v: float):
         self._sb_offset.blockSignals(True)
-        self._sb_offset.setValue(value)
+        self._sb_offset.setValue(v)
         self._sb_offset.blockSignals(False)
 
-    def set_visible(self, visible: bool):
+    def set_visible(self, v: bool):
         self._cb.blockSignals(True)
-        self._cb.setChecked(visible)
+        self._cb.setChecked(v)
         self._cb.blockSignals(False)
 
     def set_unit(self, unit: str):
-        self._unit = unit or ''
-        self._lbl_unit.setText(self._unit)
-        self._refresh_tip()
+        self._unit = unit
+        base = self._lbl_name.toolTip()
+        name = base.split('\n')[0]
+        if unit:
+            self._lbl_name.setToolTip(f'{name}\n[{unit}]')
 
     def set_name(self, name: str):
-        self._full_name = name
-        width = max(48, self._lbl_name.width())
-        shown = QFontMetrics(self._lbl_name.font()).elidedText(name, Qt.ElideRight, width)
-        self._lbl_name.setText(shown)
-        self._refresh_tip()
+        self._lbl_name.setText(name)
+        self._lbl_name.setToolTip(name + (f'\n[{self._unit}]' if self._unit else ''))
 
-    def _refresh_tip(self):
-        tip = self._full_name
-        if self._unit:
-            tip += f'\n[{self._unit}]'
-        self._lbl_name.setToolTip(tip)
-        self._lbl_unit.setToolTip(self._unit)
-
-    def set_value(self, value: float):
-        if value is None or not math.isfinite(value):
-            self._val.setText('—')
-        else:
-            self._val.setText(f'{value:+.4g}')
-
-    def clear_value(self):
-        self._val.setText('—')
-
-    def set_active(self, active: bool):
-        self._active = active
-        self._update_bg()
-
-    def _update_bg(self):
-        if self._active:
-            self.setStyleSheet(
-                '#chRow { background:#d6eaff; border-left:3px solid #0070c0; }'
-            )
-        else:
-            self.setStyleSheet(
-                '#chRow { background:transparent; border-left:3px solid transparent; }'
-            )
-
-    def mousePressEvent(self, event):
-        self.sig_activated.emit(self._idx)
-        super().mousePressEvent(event)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.set_name(self._full_name)
+    def reset(self):
+        self.set_scale(1.0)
+        self.set_offset(0.0)
+        self.set_visible(True)
 
 
 class ChannelPanel(QWidget):
-    sig_visibility = Signal(int, bool)
-    sig_scale = Signal(int, float)
-    sig_offset = Signal(int, float)
-    sig_auto = Signal(int)
+    sig_visibility      = Signal(int, bool)
+    sig_scale           = Signal(int, float)
+    sig_offset          = Signal(int, float)
+    sig_auto            = Signal(int)
     sig_calib_requested = Signal(int)
-    sig_activated = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumWidth(280)
+        self.setMinimumWidth(sum(_COLS) + 8 + 16)
         self._rows: list[ChannelRow] = []
-        self._active_idx = 0
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        layout.setContentsMargins(2, 4, 2, 2)
+        layout.setSpacing(2)
 
-        hdr = QWidget()
-        hdr.setObjectName('chHeader')
-        hdr.setAttribute(Qt.WA_StyledBackground, True)
-        hdr.setStyleSheet('#chHeader { background:#e8e8e8; }')
-        hrow = QHBoxLayout(hdr)
-        hrow.setContentsMargins(4, 2, 4, 2)
-        hrow.setSpacing(4)
-        for text, stretch in (
-            ('', 0), ('', 0), ('Имя', 2), ('Значение', 1),
-            ('Ед./дел', 0), ('Ед.', 0), ('Смещ.', 0),
-        ):
-            lab = QLabel(text)
-            lab.setFont(ui_font(-1))
-            if stretch:
-                hrow.addWidget(lab, stretch=stretch)
+        # Заголовок столбцов — те же ширины и тот же правый зазор, что у строк.
+        self._hdr = QWidget()
+        self._hdr.setFixedHeight(_ROW_H + 4)
+        self._hdr.setAutoFillBackground(True)
+        self._hrow = QHBoxLayout(self._hdr)
+        self._hrow.setContentsMargins(4, 2, 4, 2)
+        self._hrow.setSpacing(0)
+        headers = ('', 'Канал', '✓', 'Y/дел', 'Смещ.', 'A', '⚙')
+        aligns = (
+            Qt.AlignCenter, Qt.AlignLeft | Qt.AlignVCenter, Qt.AlignCenter,
+            Qt.AlignRight | Qt.AlignVCenter, Qt.AlignRight | Qt.AlignVCenter,
+            Qt.AlignCenter, Qt.AlignCenter,
+        )
+        # Y/дел и Смещ. заканчиваются над числом, а не над стрелкой поля.
+        right_pad = (0, 0, 0, _ARROW_W, _ARROW_W, 0, 0)
+        for txt, width, align, pad in zip(headers, _COLS, aligns, right_pad):
+            self._hrow.addWidget(_vgrid())
+            label = QLabel(txt)
+            if txt == 'Канал':
+                label.setMinimumWidth(width)
+                label.setSizePolicy(
+                    QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+                )
             else:
-                hrow.addWidget(lab)
-        layout.addWidget(hdr)
+                label.setFixedWidth(width)
+            label.setAlignment(align)
+            if txt == '⚙':
+                label.setPixmap(_gear_pixmap(13))
+                label.setText('')
+            if pad:
+                label.setContentsMargins(0, 0, pad, 0)
+            self._hrow.addWidget(label)
+        self._hrow.addWidget(_vgrid())
+        layout.addWidget(self._hdr)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet('color: #cccccc;')
         layout.addWidget(sep)
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.verticalScrollBar().rangeChanged.connect(self._sync_header_scrollbar)
         layout.addWidget(self._scroll)
 
     def setup(self, names: list[str], colors: list[str]):
@@ -262,6 +270,7 @@ class ChannelPanel(QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(0)
         self._rows.clear()
+
         for i, (name, color) in enumerate(zip(names, colors)):
             row = ChannelRow(i, name, color)
             row.sig_visibility.connect(self.sig_visibility)
@@ -269,31 +278,22 @@ class ChannelPanel(QWidget):
             row.sig_offset.connect(self.sig_offset)
             row.sig_auto.connect(self.sig_auto)
             row.sig_calib_requested.connect(self.sig_calib_requested)
-            row.sig_activated.connect(self.sig_activated)
             vl.addWidget(row)
             self._rows.append(row)
+
         vl.addStretch()
         self._scroll.setWidget(container)
-        self._active_idx = 0
-        if self._rows:
-            self._rows[0].set_active(True)
+        self._sync_header_scrollbar()
 
-    def apply_state(self, state: ChannelState):
-        idx = state.index
-        if not (0 <= idx < len(self._rows)):
-            return
-        row = self._rows[idx]
-        row.set_name(state.name)
-        row.set_unit(state.unit)
-        row.set_visible(state.visible)
-        row.set_y_per_div(state.y_per_div)
-        row.set_offset(state.offset)
+    def _sync_header_scrollbar(self, *_):
+        """Полоса прокрутки сужает строки. Шапка получает тот же правый отступ."""
+        sb = self._scroll.verticalScrollBar()
+        gap = sb.sizeHint().width() if sb.maximum() > sb.minimum() else 0
+        self._hrow.setContentsMargins(4, 2, 4 + gap, 2)
 
     def update_scale_offset(self, idx: int, scale: float, offset: float):
-        """scale — визуальный множитель графика. В комбо показываем цену деления."""
-        from core.measure import y_per_div_from_scale
         if 0 <= idx < len(self._rows):
-            self._rows[idx].set_y_per_div(y_per_div_from_scale(scale))
+            self._rows[idx].set_scale(scale)
             self._rows[idx].set_offset(offset)
 
     def update_unit(self, idx: int, unit: str):
@@ -303,29 +303,3 @@ class ChannelPanel(QWidget):
     def update_name(self, idx: int, name: str):
         if 0 <= idx < len(self._rows):
             self._rows[idx].set_name(name)
-
-    def update_values(self, y_vals):
-        if y_vals is None:
-            self.clear_values()
-            return
-        for i, row in enumerate(self._rows):
-            if i < len(y_vals):
-                row.set_value(float(y_vals[i]))
-            else:
-                row.clear_value()
-
-    def clear_values(self):
-        for row in self._rows:
-            row.clear_value()
-
-    def set_active(self, idx: int):
-        if not (0 <= idx < len(self._rows)):
-            return
-        if 0 <= self._active_idx < len(self._rows):
-            self._rows[self._active_idx].set_active(False)
-        self._active_idx = idx
-        self._rows[idx].set_active(True)
-
-    @property
-    def active_channel(self) -> int:
-        return self._active_idx

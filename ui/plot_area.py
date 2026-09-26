@@ -13,14 +13,10 @@ import types
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QMenu, QLabel
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QMenu
 from PySide6.QtCore import QTimer, Signal, Qt
 from PySide6.QtGui import QCursor
 
-from core.channel_state import ChannelState
-from core.measure import (
-    fmt_span, index_range, scale_from_y_per_div, y_per_div_from_scale,
-)
 from core.ring_buffer import RingBuffer
 from core.session import Block
 
@@ -39,6 +35,17 @@ TIME_DIV_SEQ: list[float] = [
 ]
 N_DIV        = 10    # делений по горизонтали
 DEFAULT_IDX  = 12    # 10 мс/дел → окно 100 мс
+
+
+def max_div_idx_for_span(span: float) -> int:
+    """Самая крупная клетка, при которой окно из 10 клеток ещё не шире данных."""
+    limit = 0
+    for i, div in enumerate(TIME_DIV_SEQ):
+        if div * N_DIV <= max(span, 0.0) * 1.02:
+            limit = i
+        else:
+            break
+    return limit
 
 
 def time_div_idx_for_span(span: float) -> int:
@@ -96,7 +103,7 @@ PLOT_STYLE_LABELS = {
     PLOT_STYLE_BARS:        'Столбики',
 }
 
-MAX_RING_SAMPLES   = 300_000  # ≤ 300 к отсчётов в кольцевом буфере (≈ 5 MB/канал)
+MAX_RING_SAMPLES   = 300_000  # ≤ 300 к отсчётов, окно не растягиваем под масштаб
 MIN_RING_SEC       = 5        # минимум 5 секунд в кольцевом буфере
 MAX_LIVE_OV_PTS    = 2_000    # точек в быстром обзорном буфере (LIVE режим)
 DEFAULT_FPS        = 25
@@ -106,16 +113,23 @@ OV_UPDATE_TICKS    = 15    # ~600 мс при 25 FPS
 
 
 def _lod_decimate(t: np.ndarray, v: np.ndarray, max_pts: int):
-    """Min/max LOD: сохраняет экстремумы сигнала."""
+    """Min/max LOD. Хвост окна не отбрасывается — иначе кривая обрывается косым срезом."""
     n = len(t)
-    if n <= max_pts:
+    if n <= max_pts or n < 2:
         return t, v
-    n_bins = max_pts // 2
-    step = n // n_bins
+    n_bins = max(1, max_pts // 2)
+    step = int(np.ceil(n / n_bins))
     if step < 2:
         return t, v
-    n_trunc = n_bins * step
-    v0 = v[:n_trunc, 0].reshape(n_bins, step)
+    n_bins = int(np.ceil(n / step))
+    if n_bins * 2 > max_pts:
+        n_bins = max_pts // 2
+        step = int(np.ceil(n / n_bins))
+    pad = n_bins * step - n
+    if pad > 0:
+        t = np.concatenate([t, np.repeat(t[-1:], pad)])
+        v = np.concatenate([v, np.repeat(v[-1:], pad, axis=0)])
+    v0 = np.ascontiguousarray(v[:n_bins * step, 0]).reshape(n_bins, step)
     imin = v0.argmin(axis=1)
     imax = v0.argmax(axis=1)
     base = np.arange(n_bins, dtype=np.intp) * step
@@ -144,11 +158,7 @@ class PlotArea(QWidget):
     cursor_moved               = Signal(float, object)   # (x_time, y_vals | None)
     selection_action_requested = Signal(str, float, float)  # action, t0, t1
     selection_changed          = Signal(float, float, int)  # t0, t1, n_samples
-    channel_changed            = Signal(int)
-    autorange_changed          = Signal(bool)
-    time_label_changed         = Signal(str)
-    zoom_limits_changed        = Signal(bool, bool)
-    context_action             = Signal(str)
+    selection_expand_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -166,13 +176,6 @@ class PlotArea(QWidget):
         self._suppress_range_signal = False
         self._active_channel = 0     # канал под управлением Ctrl+=/−
         self._mouse_proxy    = None  # SignalProxy для отслеживания курсора
-        self._names: list[str] = []
-        self._units: list[str] = []
-        self._legend_on = False
-        self._live_edit = False
-        self._right_dragged = False
-        self._m1_frac = 0.3
-        self._m2_frac = 0.7
 
         # --- стиль графиков ---
         self._plot_style = PLOT_STYLE_LINE
@@ -219,15 +222,9 @@ class PlotArea(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.addWidget(self._plot)
 
-        self._placeholder = QLabel('Нет данных. Выберите источник и нажмите Старт.', self)
-        self._placeholder.setAlignment(Qt.AlignCenter)
-        self._placeholder.setStyleSheet('color:#555555; background:transparent;')
-        self._placeholder.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-
         vb = self._plot.plotItem.getViewBox()
         vb.sigRangeChangedManually.connect(self._on_manual_zoom)
         vb.sigXRangeChanged.connect(self._on_x_range_changed)
-        vb.sigStateChanged.connect(self._on_vb_state)
 
         self._timer   = QTimer()
         self._timer.setInterval(1000 // DEFAULT_FPS)
@@ -257,31 +254,14 @@ class PlotArea(QWidget):
     # ------------------------------------------------------------------
 
     def _install_discrete_wheel(self):
-        plot = self
-
         def _wheel(ev, axis=None):
             try:
                 delta = ev.angleDelta().y()
             except AttributeError:
                 delta = ev.delta()
-            mods = ev.modifiers() if hasattr(ev, 'modifiers') else Qt.NoModifier
-            vb = plot._plot.plotItem.getViewBox()
-            cursor_t = None
-            if hasattr(ev, 'scenePos'):
-                cursor_t = float(vb.mapSceneToView(ev.scenePos()).x())
-            if mods & Qt.ControlModifier:
-                plot.y_zoom_active(1.5 if delta > 0 else 1.0 / 1.5)
-            elif mods & Qt.ShiftModifier:
-                plot.scroll_left_div() if delta > 0 else plot.scroll_right_div()
-            else:
-                plot._zoom_time_at(1 if delta > 0 else -1, cursor_t)
+            self.zoom_in_discrete() if delta > 0 else self.zoom_out_discrete()
             ev.accept()
-
         self._plot.plotItem.getViewBox().wheelEvent = _wheel
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._placeholder.setGeometry(self.rect())
 
     def _install_mouse_tracking(self):
         """Подключить отслеживание позиции курсора над графиком."""
@@ -317,12 +297,8 @@ class PlotArea(QWidget):
         self._static_mode = False
         self._static_times  = None
         self._static_values = None
-        self._active_channel = 0
-        self._names = list(names)
-        self._units = [''] * n_channels
-        self._plot.plotItem.getViewBox().setLimits(
-            xMin=None, xMax=None, minXRange=None, maxXRange=None,
-        )
+        # Снять ограничения диапазона (живой режим — границы не фиксированы)
+        self._plot.plotItem.getViewBox().setLimits(xMin=None, xMax=None)
 
         if self._legend is not None:
             try:
@@ -339,9 +315,11 @@ class PlotArea(QWidget):
         was_markers_on   = self._markers_on
         self._markers_on = False
 
-        # Кольцевой буфер: не более MAX_RING_SAMPLES, но не менее MIN_RING_SEC
-        capacity      = max(MIN_RING_SEC * sample_rate,
-                            min(MAX_RING_SAMPLES, 30 * sample_rate))
+        # Фиксированное кольцо. Масштаб его не раздувает: клетка не становится
+        # шире, чем уже записанная история.
+        self._sample_rate = sample_rate
+        capacity = max(MIN_RING_SEC * sample_rate,
+                       min(MAX_RING_SAMPLES, 30 * sample_rate))
         self._buffer  = RingBuffer(n_channels, capacity)
         # Лёгкий обзорный буфер: по 1 точке на каждый вызов push_data
         self._ov_buf  = RingBuffer(n_channels, MAX_LIVE_OV_PTS)
@@ -354,7 +332,6 @@ class PlotArea(QWidget):
         self._legend = self._plot.addLegend(offset=(10, 10), labelTextColor='#202020')
         self._legend.setBrush(pg.mkBrush(255, 255, 255, 220))
         self._legend.setPen(pg.mkPen('#888888', width=1))
-        self._legend.setVisible(self._legend_on)
 
         for i in range(n_channels):
             color = CHANNEL_COLORS[i % len(CHANNEL_COLORS)]
@@ -371,11 +348,9 @@ class PlotArea(QWidget):
             self._curves.append(c)
 
         self._plot.enableAutoRange(axis='y', enable=True)
-        self._refresh_axis_mode()
         self._apply_time_div()
         self._install_mouse_tracking()
         self.clear_selection()
-        self.hide_placeholder()
 
         if was_markers_on:
             self.show_markers(True)
@@ -405,14 +380,11 @@ class PlotArea(QWidget):
         self.following_changed.emit(False)
 
         t0, t1 = float(block.t_start), float(block.t_end)
-        self._units = [ch.unit for ch in block.channels]
-        self._apply_x_limits(t0, t1)
-        self._plot.enableAutoRange(axis='y', enable=True)
-        self._refresh_axis_mode()
+        self._plot.plotItem.getViewBox().setLimits(xMin=t0, xMax=t1)
         if fit:
+            self._plot.enableAutoRange(axis='y', enable=True)
             self.fit_to_span(t0, t1, anchor='start')
         self._emit_overview()
-        self.hide_placeholder()
 
     # ------------------------------------------------------------------
     # Дискретный масштаб
@@ -423,77 +395,30 @@ class PlotArea(QWidget):
         return self._time_div_idx
 
     def zoom_in_discrete(self):
-        self._zoom_time_at(+1, None)
+        if self._time_div_idx > 0:
+            self._time_div_idx -= 1
+            self._apply_time_div()
 
     def zoom_out_discrete(self):
-        self._zoom_time_at(-1, None)
+        if self._time_div_idx < min(len(TIME_DIV_SEQ) - 1, self._max_div_idx()):
+            self._time_div_idx += 1
+            self._apply_time_div()
 
-    def set_time_div_idx(self, idx: int):
-        self._time_div_idx = max(0, min(idx, self._max_time_idx()))
-        self._apply_time_div()
-
-    def _max_time_idx(self) -> int:
-        span = self._data_span()
-        if span is None or span <= 0:
-            return len(TIME_DIV_SEQ) - 1
-        return time_div_idx_for_span(span)
-
-    def _data_span(self) -> float | None:
+    def _history_span(self) -> float:
         if self._static_mode and self._static_times is not None and len(self._static_times) >= 2:
             return float(self._static_times[-1] - self._static_times[0])
-        return None
+        if self._buffer is not None:
+            bounds = self._buffer.time_bounds()
+            if bounds is not None:
+                return bounds[1] - bounds[0]
+        return 0.0
 
-    def _apply_x_limits(self, t0: float, t1: float):
-        span = max(t1 - t0, 1e-12)
-        min_w = min(span, TIME_DIV_SEQ[0] * N_DIV)
-        self._plot.plotItem.getViewBox().setLimits(
-            xMin=t0, xMax=t1, minXRange=min_w, maxXRange=span,
-        )
+    def _max_div_idx(self) -> int:
+        return max_div_idx_for_span(self._history_span())
 
-    def _zoom_time_at(self, direction: int, cursor_t: float | None):
-        """direction > 0 приближает. Курсор сохраняет долю окна."""
-        old = self.view_range()
-        nxt = self._time_div_idx + (-1 if direction > 0 else 1)
-        nxt = max(0, min(nxt, self._max_time_idx()))
-        if nxt == self._time_div_idx:
-            self._emit_zoom_limits()
-            return
-        self._time_div_idx = nxt
-        window = TIME_DIV_SEQ[self._time_div_idx] * N_DIV
-        if old is None:
-            self._apply_time_div()
-            return
-        width = max(old[1] - old[0], 1e-15)
-        if cursor_t is None:
-            frac = 0.5
-            anchor = (old[0] + old[1]) / 2.0
-        else:
-            frac = min(1.0, max(0.0, (cursor_t - old[0]) / width))
-            anchor = cursor_t
-        self._static_dirty = True
-        self._set_x_range(anchor - window * frac, anchor + window * (1.0 - frac))
-        self._emit_time_label()
-        self.time_div_changed.emit(self._time_div_idx)
-        self._emit_zoom_limits()
-
-    def time_div_label(self) -> str:
-        vr = self.view_range()
-        nominal = TIME_DIV_SEQ[self._time_div_idx]
-        if vr is None:
-            return fmt_time_div(nominal)
-        per = (vr[1] - vr[0]) / N_DIV
-        if nominal > 0 and abs(per - nominal) / nominal < 0.08:
-            return fmt_time_div(nominal)
-        return '≈' + fmt_time_div(per)
-
-    def _emit_time_label(self):
-        self.time_label_changed.emit(self.time_div_label())
-
-    def _emit_zoom_limits(self):
-        self.zoom_limits_changed.emit(
-            self._time_div_idx > 0,
-            self._time_div_idx < self._max_time_idx(),
-        )
+    def set_time_div_idx(self, idx: int):
+        self._time_div_idx = max(0, min(idx, len(TIME_DIV_SEQ) - 1))
+        self._apply_time_div()
 
     def fit_to_span(self, t0: float, t1: float, anchor: str = 'start'):
         """Подобрать 1-2-5 так, чтобы span влез в окно, и выставить вид."""
@@ -530,8 +455,6 @@ class PlotArea(QWidget):
             self._set_x_range(c - window / 2, c + window / 2)
 
         self.time_div_changed.emit(self._time_div_idx)
-        self._emit_time_label()
-        self._emit_zoom_limits()
 
     # ------------------------------------------------------------------
     # Навигация
@@ -576,10 +499,65 @@ class PlotArea(QWidget):
         if not self._static_mode:
             self.set_following(False)
 
+    def restore_paused_view(self, t_min: float, t_max: float, div_idx: int):
+        """Вернуть окно, которое держала пауза. Масштаб и кнопку паузы не трогает."""
+        self._time_div_idx = max(0, min(int(div_idx), len(TIME_DIV_SEQ) - 1))
+        t_div = TIME_DIV_SEQ[self._time_div_idx]
+        try:
+            self._plot.getAxis('bottom').setTickSpacing(major=t_div, minor=t_div / 5)
+        except Exception:
+            pass
+        self.time_div_changed.emit(self._time_div_idx)
+        self._static_dirty = True
+        self._set_x_range(t_min, t_max)
+
+    def restore_channel_gains(self, scales, offsets) -> None:
+        """Вернуть множители Y, которые setup() обнуляет при сборке блока."""
+        n = min(len(scales), len(offsets), len(self._scales), self._n_channels)
+        if n <= 0:
+            return
+        self._scales[:n] = np.asarray(scales[:n], dtype=np.float64)
+        self._offsets[:n] = np.asarray(offsets[:n], dtype=np.float64)
+        self._static_dirty = True
+
+    def restore_y_range(self, y0: float, y1: float, auto_y: bool) -> None:
+        """Оставить вертикальный масштаб. Авто Y включает подгонку заново."""
+        if auto_y:
+            self.set_y_autorange(True)
+            return
+        self.set_y_autorange(False)
+        self._plot.setYRange(y0, y1, padding=0)
+
+    def expand_selection(self, scale_y: bool) -> float | None:
+        """Выделенный интервал — на всю ширину экрана. Вернуть с/дел или None."""
+        sel = self.get_selection()
+        if sel is None:
+            return None
+        t0, t1 = sel
+        span = t1 - t0
+        if span <= 1e-12:
+            return None
+        yr = self._plot.plotItem.getViewBox().viewRange()[1]
+        if self._following and not self._static_mode:
+            self.set_following(False)
+        t_div = span / N_DIV
+        try:
+            self._plot.getAxis('bottom').setTickSpacing(major=t_div, minor=t_div / 5)
+        except Exception:
+            pass
+        self._time_div_idx = time_div_idx_for_span(span)
+        self._static_dirty = True
+        self._set_x_range(t0, t1)
+        self._refresh()
+        if scale_y:
+            self.set_y_autorange(True)
+        else:
+            self.set_y_autorange(False)
+            self._plot.setYRange(float(yr[0]), float(yr[1]), padding=0)
+        return t_div
+
     def _set_x_range(self, t_min: float, t_max: float):
-        if t_min < 0.0:
-            t_max -= t_min   # сохранить ширину окна
-            t_min = 0.0
+        # Ширину не переписываем: иначе шкала уезжает в будущее и клетка «растёт».
         self._plot.setXRange(t_min, t_max, padding=0)
 
     def scroll_left_div(self):
@@ -651,7 +629,7 @@ class PlotArea(QWidget):
         for i in range(self._n_channels):
             self._scales[i]  = s
             self._offsets[i] = 0.0
-        self._note_manual_y()
+        self._static_dirty = True
         return [(s, 0.0)] * self._n_channels
 
     def y_align_distribute(self) -> list[tuple[float, float]]:
@@ -671,7 +649,7 @@ class PlotArea(QWidget):
             self._scales[i]  = s
             self._offsets[i] = center
             results.append((s, center))
-        self._note_manual_y()
+        self._static_dirty = True
         return results
 
     def y_align_auto(self) -> list[tuple[float, float]]:
@@ -686,7 +664,7 @@ class PlotArea(QWidget):
             self._scales[i]  = s
             self._offsets[i] = 0.0
             results.append((s, 0.0))
-        self._note_manual_y()
+        self._static_dirty = True
         return results
 
     def y_align_grids(self) -> list[tuple[float, float]]:
@@ -700,125 +678,19 @@ class PlotArea(QWidget):
             self._scales[i]  = 1.0
             self._offsets[i] = 0.0
             results.append((1.0, 0.0))
-        self._refresh_axis_mode()
         self._static_dirty = True
-        self.channel_changed.emit(-1)
         return results
 
     def set_active_channel(self, idx: int):
         if 0 <= idx < self._n_channels:
             self._active_channel = idx
-            self._refresh_axis_mode()
-            self.channel_changed.emit(idx)
 
     def update_active_channel_yaxis(self, name: str, unit: str):
-        """Обновить имя и единицу активного канала и подпись оси."""
-        i = self._active_channel
-        self.set_channel_meta(i, name=name, unit=unit)
-
-    def set_channel_meta(self, idx: int, name: str | None = None, unit: str | None = None):
-        if 0 <= idx < len(self._names) and name is not None:
-            self._names[idx] = name
-            if idx < len(self._curves) and self._legend is not None:
-                # Имя в легенде обновится при следующей пересборке кривых.
-                pass
-        if 0 <= idx < len(self._units) and unit is not None:
-            self._units[idx] = unit
-        self._refresh_axis_mode()
-        self.channel_changed.emit(idx)
-
-    def _refresh_axis_mode(self):
-        ax = self._plot.getAxis('left')
-        if self._n_channels <= 0 or len(self._scales) == 0:
-            ax.setStyle(showValues=True)
-            ax.setLabel('')
-            return
-        natural = (
-            np.allclose(self._scales, 1.0) and np.allclose(self._offsets, 0.0)
-        )
-        if natural:
-            ax.setStyle(showValues=True)
-            i = min(self._active_channel, len(self._names) - 1)
-            name = self._names[i] if self._names else ''
-            unit = self._units[i] if i < len(self._units) else ''
-            label = f'{name} [{unit}]' if unit else name
-            ax.setLabel(label)
-        else:
-            ax.setStyle(showValues=False)
-            ax.setLabel('')
-
-    def _note_manual_y(self):
-        """Ручное Y выключает автомасштаб, иначе зум не виден."""
-        vb = self._plot.plotItem.getViewBox()
-        if vb.autoRangeEnabled()[1]:
-            self._plot.enableAutoRange(axis='y', enable=False)
-            self.autorange_changed.emit(False)
-        self._static_dirty = True
-        self._refresh_axis_mode()
-        self._sync_bar_fills()
-        self.channel_changed.emit(-1)
-
-    def y_autorange(self) -> bool:
-        return bool(self._plot.plotItem.getViewBox().autoRangeEnabled()[1])
-
-    def channel_states(self) -> list[ChannelState]:
-        out = []
-        for i in range(self._n_channels):
-            scale = float(self._scales[i]) if i < len(self._scales) else 1.0
-            out.append(ChannelState(
-                index=i,
-                name=self._names[i] if i < len(self._names) else f'CH{i + 1}',
-                unit=self._units[i] if i < len(self._units) else '',
-                color=self._channel_colors[i] if i < len(self._channel_colors) else '#888888',
-                visible=self._visible[i] if i < len(self._visible) else True,
-                y_per_div=y_per_div_from_scale(scale),
-                offset=float(self._offsets[i]) if i < len(self._offsets) else 0.0,
-                calib_a=float(self._calib_coeff[i]) if i < len(self._calib_coeff) else 1.0,
-                calib_b=float(self._calib_offset[i]) if i < len(self._calib_offset) else 0.0,
-            ))
-        return out
-
-    def set_y_per_div(self, idx: int, y_per_div: float):
-        if not (0 <= idx < len(self._scales)):
-            return
-        if not np.isfinite(y_per_div) or y_per_div == 0.0:
-            return
-        self._scales[idx] = scale_from_y_per_div(y_per_div)
-        self._note_manual_y()
-
-    def set_live_edit(self, live: bool):
-        self._live_edit = live
-
-    def show_placeholder(self, text: str):
-        self._placeholder.setText(text)
-        self._placeholder.show()
-        self._placeholder.raise_()
-
-    def hide_placeholder(self):
-        self._placeholder.hide()
-
-    def set_legend_visible(self, visible: bool):
-        self._legend_on = visible
-        if self._legend is not None:
-            self._legend.setVisible(visible)
-
-    def plot_item(self):
-        return self._plot.plotItem
-
-    def view_range(self) -> tuple[float, float] | None:
-        try:
-            vr = self._plot.plotItem.getViewBox().viewRange()[0]
-            return float(vr[0]), float(vr[1])
-        except Exception:
-            return None
-
-    @property
-    def n_channels(self) -> int:
-        return self._n_channels
-
-    @property
-    def is_static(self) -> bool:
-        return self._static_mode
+        """Обновить подпись оси Y для активного канала."""
+        label = name
+        if unit:
+            label += f' [{unit}]'
+        self._plot.getAxis('left').setLabel(label)
 
     @property
     def active_channel(self) -> int:
@@ -829,7 +701,7 @@ class PlotArea(QWidget):
         i = self._active_channel
         if 0 <= i < self._n_channels:
             self._scales[i] *= factor
-            self._note_manual_y()
+            self._static_dirty = True
             return self._scales[i], self._offsets[i]
         return None
 
@@ -838,7 +710,7 @@ class PlotArea(QWidget):
         i = self._active_channel
         if 0 <= i < self._n_channels:
             self._offsets[i] += delta_divs * self._scales[i]
-            self._note_manual_y()
+            self._static_dirty = True
             return self._scales[i], self._offsets[i]
         return None
 
@@ -847,8 +719,7 @@ class PlotArea(QWidget):
         results = []
         for i in range(self._n_channels):
             self._scales[i] *= factor
-            results.append((float(self._scales[i]), float(self._offsets[i])))
-        self._note_manual_y()
+            results.append((self._scales[i], self._offsets[i]))
         return results
 
     def clear_everything(self):
@@ -886,7 +757,7 @@ class PlotArea(QWidget):
         self._following     = False
         self.following_changed.emit(False)
         t0, t1 = float(times[0]), float(times[-1])
-        self._apply_x_limits(t0, t1)
+        self._plot.plotItem.getViewBox().setLimits(xMin=t0, xMax=t1)
         self._plot.enableAutoRange(axis='y', enable=True)
         self.fit_to_span(t0, t1, anchor='end')
         self._emit_overview()
@@ -896,8 +767,9 @@ class PlotArea(QWidget):
     def push_data(self, times: np.ndarray, values: np.ndarray):
         if self._buffer is not None and not self._static_mode:
             self._buffer.push(times, values)
-            if len(times):
-                self.hide_placeholder()
+            # Один отсчёт на батч — лёгкий обзорный буфер
+            if self._ov_buf is not None and len(times):
+                self._ov_buf.push(times[-1:], values[-1:])
 
     def stop(self):
         self._timer.stop()
@@ -912,17 +784,16 @@ class PlotArea(QWidget):
     def set_y_autorange(self, enabled: bool):
         """Включить / выключить автомасштабирование по оси Y."""
         self._plot.enableAutoRange(axis='y', enable=enabled)
-        self.autorange_changed.emit(bool(enabled))
 
     def set_channel_scale(self, idx: int, scale: float):
         if 0 <= idx < len(self._scales):
             self._scales[idx] = scale
-            self._note_manual_y()
+            self._static_dirty = True
 
     def set_channel_offset(self, idx: int, offset: float):
         if 0 <= idx < len(self._offsets):
             self._offsets[idx] = offset
-            self._note_manual_y()
+            self._static_dirty = True
 
     def set_channel_visible(self, idx: int, visible: bool):
         if 0 <= idx < len(self._visible):
@@ -951,34 +822,59 @@ class PlotArea(QWidget):
             return float(self._calib_coeff[idx]), float(self._calib_offset[idx])
         return 1.0, 0.0
 
-    def auto_scale_channel(self, idx: int) -> tuple[float, float] | None:
-        v_src = self._static_values if self._static_mode else None
-        if v_src is None and self._buffer and self._buffer.size >= 2:
-            _, v_src = self._buffer.get_last(min(self._buffer.size, 10000))
-        if v_src is None or idx >= v_src.shape[1]:
+    def _column_on_screen(self, idx: int, x0: float, x1: float) -> np.ndarray | None:
+        """Калиброванные отсчёты канала в текущем окне по X."""
+        if self._static_mode and self._static_times is not None and self._static_values is not None:
+            t = self._static_times
+            if idx >= self._static_values.shape[1] or len(t) < 2:
+                return None
+            i0 = max(0, int(np.searchsorted(t, min(x0, x1))) - 1)
+            i1 = min(len(t), int(np.searchsorted(t, max(x0, x1))) + 1)
+            raw = self._static_values[i0:i1, idx]
+        elif self._buffer is not None and self._buffer.size >= 2:
+            _, vals = self._buffer.get_span(min(x0, x1), max(x0, x1), None)
+            if idx >= vals.shape[1] or len(vals) == 0:
+                return None
+            raw = vals[:, idx]
+        else:
             return None
-        # Работаем на откалиброванных данных
-        raw = v_src[:, idx]
-        A   = float(self._calib_coeff[idx])  if idx < len(self._calib_coeff)  else 1.0
-        B   = float(self._calib_offset[idx]) if idx < len(self._calib_offset) else 0.0
-        calib = raw * A + B
-        vmax = float(np.max(np.abs(calib)))
-        scale  = (1.0 / vmax) if vmax > 1e-12 else 1.0
-        self._scales[idx]  = scale
-        self._offsets[idx] = 0.0
-        self._note_manual_y()
-        return scale, 0.0
+        a = float(self._calib_coeff[idx]) if idx < len(self._calib_coeff) else 1.0
+        b = float(self._calib_offset[idx]) if idx < len(self._calib_offset) else 0.0
+        return raw.astype(np.float64) * a + b
 
-    def _series(self) -> tuple[np.ndarray | None, np.ndarray | None]:
-        if self._static_mode and self._static_times is not None:
-            return self._static_times, self._static_values
-        if self._buffer and self._buffer.size >= 2:
-            return self._buffer.get()
-        return None, None
+    def auto_scale_channel(self, idx: int) -> tuple[float, float] | None:
+        """Вписать канал в текущий экран: min..max видимого куска на всю высоту оси Y."""
+        xr, yr = self._plot.plotItem.getViewBox().viewRange()
+        x0, x1 = float(xr[0]), float(xr[1])
+        y0, y1 = float(yr[0]), float(yr[1])
+        if y1 - y0 < 1e-12:
+            return None
+        col = self._column_on_screen(idx, x0, x1)
+        if col is None or len(col) == 0:
+            return None
+        dmin = float(np.min(col))
+        dmax = float(np.max(col))
+        span = dmax - dmin
+        if span < 1e-12:
+            span = max(abs(dmax), abs(dmin), 1e-6)
+            dmin -= span / 2
+            dmax += span / 2
+        view = y1 - y0
+        pad = 0.08 * view
+        scale = (view - 2 * pad) / span
+        offset = (y0 + y1) / 2 - (dmin + dmax) / 2 * scale
+        self._scales[idx] = scale
+        self._offsets[idx] = offset
+        self.set_y_autorange(False)
+        self._static_dirty = True
+        return scale, offset
 
-    def get_values_at(self, t: float, physical: bool = True) -> np.ndarray | None:
-        t_src, v_src = self._series()
-        if t_src is None or v_src is None or len(t_src) < 2:
+    def get_values_at(self, t: float) -> np.ndarray | None:
+        t_src = self._static_times if self._static_mode else None
+        v_src = self._static_values if self._static_mode else None
+        if t_src is None and self._buffer and self._buffer.size >= 2:
+            t_src, v_src = self._buffer.get_last(min(self._buffer.size, 5000))
+        if t_src is None or len(t_src) < 2:
             return None
         idx = int(np.searchsorted(t_src, t))
         idx = max(0, min(idx, len(t_src) - 1))
@@ -986,24 +882,7 @@ class PlotArea(QWidget):
         n   = len(raw)
         calib_c = self._calib_coeff[:n]  if len(self._calib_coeff)  >= n else np.ones(n)
         calib_o = self._calib_offset[:n] if len(self._calib_offset) >= n else np.zeros(n)
-        phys = raw * calib_c + calib_o
-        if physical:
-            return phys.copy()
-        return (phys * self._scales[:n] + self._offsets[:n]).copy()
-
-    def get_range_data(self, t0: float, t1: float):
-        """Физические отсчёты диапазона, без визуальных scale/offset."""
-        t_src, v_src = self._series()
-        if t_src is None or v_src is None or len(t_src) == 0:
-            return None, None
-        i0, i1 = index_range(t_src, t0, t1)
-        if i1 <= i0:
-            return t_src[:0], np.empty((0, v_src.shape[1]), dtype=np.float64)
-        raw = v_src[i0:i1].astype(np.float64, copy=True)
-        for i in range(raw.shape[1]):
-            a, b = self.get_channel_calib(i)
-            raw[:, i] = raw[:, i] * a + b
-        return t_src[i0:i1], raw
+        return ((raw * calib_c + calib_o) * self._scales[:n] + self._offsets[:n]).copy()
 
     def set_following(self, v: bool):
         self._following = v
@@ -1017,12 +896,10 @@ class PlotArea(QWidget):
                 self._plot.addItem(self._m1)
             if self._m2 not in items:
                 self._plot.addItem(self._m2)
-            self._m1_frac = 0.3
-            self._m2_frac = 0.7
-            vr = self._plot.plotItem.getViewBox().viewRange()[0]
+            vr   = self._plot.plotItem.getViewBox().viewRange()[0]
             span = vr[1] - vr[0]
-            self._m1.setPos(vr[0] + span * self._m1_frac)
-            self._m2.setPos(vr[0] + span * self._m2_frac)
+            self._m1.setPos(vr[0] + span * 0.3)
+            self._m2.setPos(vr[0] + span * 0.7)
         else:
             for m in (self._m1, self._m2):
                 try:
@@ -1090,15 +967,11 @@ class PlotArea(QWidget):
             c.opts['stepMode'] = False
 
         elif s == PLOT_STYLE_BARS:
+            # stepMode требует len(X)=len(Y)+1 — используем fillLevel=0 без stepMode
+            # (заполнение до нуля даёт визуальный эффект «столбиков» при зуме)
             c.setPen(pg.mkPen(color=color, width=1))
             c.setSymbol(None)
-            level = 0.0
-            try:
-                idx = self._curves.index(c)
-                level = float(self._offsets[idx])
-            except ValueError:
-                pass
-            c.setFillLevel(level)
+            c.setFillLevel(0)
             c.setBrush(pg.mkBrush(color + '60'))
             c.opts['stepMode'] = False
 
@@ -1130,108 +1003,64 @@ class PlotArea(QWidget):
 
     def _count_samples_in(self, t0: float, t1: float) -> int:
         """Число отсчётов в диапазоне [t0, t1]."""
-        t_src, _v = self._series()
+        t_src = self._static_times if self._static_mode else None
+        if t_src is None and self._buffer and self._buffer.size >= 2:
+            t_src, _ = self._buffer.get_last(
+                min(self._buffer.size, MAX_RING_SAMPLES))
         if t_src is None:
             return 0
-        i0, i1 = index_range(t_src, t0, t1)
-        return i1 - i0
+        i0 = int(np.searchsorted(t_src, t0))
+        i1 = int(np.searchsorted(t_src, t1, side='right'))
+        return max(0, i1 - i0)
 
     def _install_selection_drag(self):
-        """ЛКМ — выделение, Ctrl+ЛКМ — зум 1-2-5, СКМ/ПКМ — pan по X."""
+        """Перехватить drag ViewBox: левая кнопка → выделение, правая → pan."""
         vb = self._plot.plotItem.getViewBox()
-        vb.setMouseMode(pg.ViewBox.PanMode)
-        self._plot.setMouseEnabled(x=False, y=False)
+        vb.setMouseMode(pg.ViewBox.RectMode)   # правый drag = pan
         _p = self
 
-        def _begin_selection(t: float):
-            if _p._selection_item is None:
-                _p._selection_item = pg.LinearRegionItem(
-                    values=[t, t],
-                    brush=pg.mkBrush(255, 180, 0, 55),
-                    pen=pg.mkPen('#cc8800', width=1),
-                    movable=True,
-                )
-                _p._selection_item.sigRegionChanged.connect(
-                    _p._on_selection_region_changed)
-                _p._plot.addItem(_p._selection_item)
-            else:
-                _p._selection_item.setRegion([t, t])
-
         def _drag(vb_self, ev, axis=None):
-            btn = ev.button()
-            mods = ev.modifiers()
-            pos = vb_self.mapSceneToView(ev.scenePos())
-            if btn == Qt.LeftButton and (mods & Qt.ControlModifier):
-                if ev.isFinish():
-                    p0 = vb_self.mapSceneToView(ev.buttonDownScenePos())
-                    t0, t1 = sorted((float(p0.x()), float(pos.x())))
-                    if t1 - t0 > 1e-9:
-                        _p.fit_to_span(t0, t1, anchor='start')
-                        _p._note_manual_y()
-                        y0, y1 = sorted((float(p0.y()), float(pos.y())))
-                        if y1 - y0 > 1e-9:
-                            vb_self.setYRange(y0, y1, padding=0)
-                ev.accept()
-                return
-            if btn == Qt.LeftButton:
-                t = _p._find_nearest_time(float(pos.x()))
+            if ev.button() == Qt.LeftButton:
+                pos = vb_self.mapSceneToView(ev.scenePos())
+                t   = _p._find_nearest_time(float(pos.x()))   # снеп к данным
+
                 if ev.isStart():
                     _p._sel_anchor = t
-                    _begin_selection(t)
+                    if _p._selection_item is None:
+                        _p._selection_item = pg.LinearRegionItem(
+                            values=[t, t],
+                            brush=pg.mkBrush(255, 180, 0, 55),
+                            pen=pg.mkPen('#cc8800', width=1),
+                            movable=True,
+                        )
+                        _p._selection_item.sigRegionChanged.connect(
+                            _p._on_selection_region_changed)
+                        _p._plot.addItem(_p._selection_item)
+                    else:
+                        _p._selection_item.setRegion([t, t])
+
                 if _p._sel_anchor is not None and _p._selection_item:
                     t0 = min(_p._sel_anchor, t)
                     t1 = max(_p._sel_anchor, t)
                     _p._selection_item.setRegion([t0, t1])
-                    _p.selection_changed.emit(t0, t1, _p._count_samples_in(t0, t1))
+                    n  = _p._count_samples_in(t0, t1)
+                    _p.selection_changed.emit(t0, t1, n)
+
                 if ev.isFinish():
                     _p._sel_anchor = None
                 ev.accept()
-                return
-            if btn in (Qt.MiddleButton, Qt.RightButton):
-                if ev.isStart():
-                    _p._pan_scene = ev.scenePos()
-                    _p._right_dragged = False
-                else:
-                    prev = getattr(_p, '_pan_scene', ev.scenePos())
-                    cur = ev.scenePos()
-                    if (cur - prev).manhattanLength() > 2:
-                        _p._right_dragged = True
-                    p1 = vb_self.mapSceneToView(prev)
-                    p2 = vb_self.mapSceneToView(cur)
-                    _p._pan_scene = cur
-                    dx = float(p2.x() - p1.x())
-                    dy = float(p2.y() - p1.y())
-                    vr = vb_self.viewRange()
-                    x0, x1 = float(vr[0][0]), float(vr[0][1])
-                    _p._set_x_range(x0 - dx, x1 - dx)
-                    if mods & Qt.ShiftModifier:
-                        y0, y1 = float(vr[1][0]), float(vr[1][1])
-                        vb_self.setYRange(y0 - dy, y1 - dy, padding=0)
-                        _p._note_manual_y()
-                    if not _p._static_mode:
-                        _p.set_following(False)
-                if ev.isFinish() and btn == Qt.RightButton and not _p._right_dragged:
-                    _p._open_context_menu(float(pos.x()))
-                ev.accept()
-                return
-            ev.ignore()
+            else:
+                pg.ViewBox.mouseDragEvent(vb_self, ev, axis)
 
         vb.mouseDragEvent = types.MethodType(_drag, vb)
 
+        # Одиночный левый клик (без движения) → снять выделение
         def _click(vb_self, ev):
-            if ev.button() == Qt.RightButton:
-                if not _p._right_dragged:
-                    pos = vb_self.mapSceneToView(ev.scenePos())
-                    _p._open_context_menu(float(pos.x()))
-                _p._right_dragged = False
-                ev.accept()
-                return
-            if ev.button() == Qt.LeftButton and not (ev.modifiers() & Qt.ControlModifier):
+            if ev.button() == Qt.LeftButton:
                 _p.clear_selection()
                 ev.accept()
-                return
-            ev.accept()
-
+            else:
+                pg.ViewBox.mouseClickEvent(vb_self, ev)
         vb.mouseClickEvent = types.MethodType(_click, vb)
 
         def _dbl_click(vb_self, ev):
@@ -1239,31 +1068,22 @@ class PlotArea(QWidget):
                 r = _p._selection_item.getRegion()
                 t0, t1 = float(r[0]), float(r[1])
                 if t1 > t0 + 1e-9:
-                    _p.fit_to_span(t0, t1, anchor='start')
+                    _p.selection_expand_requested.emit()
                     ev.accept()
                     return
             pg.ViewBox.mouseDoubleClickEvent(vb_self, ev)
-
         vb.mouseDoubleClickEvent = types.MethodType(_dbl_click, vb)
 
+        orig_ctx = vb.__class__.raiseContextMenu
+
         def _ctx(vb_self, ev):
-            ev.accept()
+            if _p._selection_item is not None:
+                r = _p._selection_item.getRegion()
+                _p._show_selection_menu(float(r[0]), float(r[1]))
+            else:
+                orig_ctx(vb_self, ev)
 
         vb.raiseContextMenu = types.MethodType(_ctx, vb)
-
-    def _open_context_menu(self, t: float):
-        sel = self.get_selection()
-        if sel is not None and sel[0] <= t <= sel[1]:
-            self._show_selection_menu(sel[0], sel[1])
-            return
-        menu = QMenu(self)
-        menu.addAction('Показать весь блок', lambda: self.context_action.emit('fit'))
-        menu.addAction('Авто Y', lambda: self.context_action.emit('auto_y'))
-        menu.addAction('Экспорт PNG', lambda: self.context_action.emit('png'))
-        if sel is not None:
-            menu.addAction('Маркеры к краям выделения', self.markers_to_selection)
-        menu.addAction('Снять выделение', self.clear_selection)
-        menu.exec(QCursor.pos())
 
     def _on_selection_region_changed(self):
         if self._selection_item is not None:
@@ -1291,37 +1111,18 @@ class PlotArea(QWidget):
 
     def _show_selection_menu(self, t0: float, t1: float):
         menu = QMenu(self)
-        dt = t1 - t0
-        copy_act = menu.addAction(
-            f'Копировать в новый блок  ({fmt_span(dt)})',
+        dt   = t1 - t0
+        menu.addAction(
+            f'Копировать в новый блок  ({dt:.4f} с)',
             lambda: self.selection_action_requested.emit('copy', t0, t1),
         )
-        del_act = menu.addAction(
+        menu.addAction(
             'Удалить выделенные данные',
             lambda: self.selection_action_requested.emit('delete', t0, t1),
         )
-        if self._live_edit:
-            for act in (copy_act, del_act):
-                act.setEnabled(False)
-                act.setToolTip('Доступно после остановки записи')
         menu.addSeparator()
-        menu.addAction('Маркеры к краям выделения', self.markers_to_selection)
         menu.addAction('Снять выделение', self.clear_selection)
         menu.exec(QCursor.pos())
-
-    def markers_to_selection(self):
-        sel = self.get_selection()
-        if sel is None:
-            return
-        self.show_markers(True)
-        self._m1.blockSignals(True)
-        self._m2.blockSignals(True)
-        self._m1.setPos(sel[0])
-        self._m2.setPos(sel[1])
-        self._m1.blockSignals(False)
-        self._m2.blockSignals(False)
-        self._remember_marker_fracs()
-        self.markers_moved.emit(float(self._m1.value()), float(self._m2.value()))
 
     # ------------------------------------------------------------------
     # Маркеры M1/M2 со снепом к реальным точкам данных
@@ -1351,47 +1152,13 @@ class PlotArea(QWidget):
             marker.setValue(snapped)
             marker.blockSignals(False)
 
-    def _remember_marker_fracs(self):
-        vr = self.view_range()
-        if vr is None:
-            return
-        width = max(vr[1] - vr[0], 1e-15)
-        self._m1_frac = (float(self._m1.value()) - vr[0]) / width
-        self._m2_frac = (float(self._m2.value()) - vr[0]) / width
-
-    def _pin_markers_to_view(self):
-        if not (self._markers_on and self._following and not self._static_mode):
-            return
-        vr = self.view_range()
-        if vr is None:
-            return
-        width = vr[1] - vr[0]
-        self._m1.blockSignals(True)
-        self._m2.blockSignals(True)
-        self._m1.setPos(vr[0] + width * self._m1_frac)
-        self._m2.setPos(vr[0] + width * self._m2_frac)
-        self._m1.blockSignals(False)
-        self._m2.blockSignals(False)
-
     def _on_m1_moved(self, _=None):
         self._snap_marker(self._m1)
-        self._remember_marker_fracs()
         self.markers_moved.emit(float(self._m1.value()), float(self._m2.value()))
 
     def _on_m2_moved(self, _=None):
         self._snap_marker(self._m2)
-        self._remember_marker_fracs()
         self.markers_moved.emit(float(self._m1.value()), float(self._m2.value()))
-
-    def _on_vb_state(self, *_args):
-        self.autorange_changed.emit(self.y_autorange())
-
-    def _sync_bar_fills(self):
-        if self._plot_style != PLOT_STYLE_BARS:
-            return
-        for i, curve in enumerate(self._curves):
-            level = float(self._offsets[i]) if i < len(self._offsets) else 0.0
-            curve.setFillLevel(level)
 
     def _on_manual_zoom(self, _=None):
         if self._following and not self._static_mode:
@@ -1428,21 +1195,18 @@ class PlotArea(QWidget):
             return None, None
 
         if self._following:
-            n = max(2, int(TIME_DIV_SEQ[self._time_div_idx] * N_DIV * self._sample_rate) + 1)
-            n = min(n, MAX_RING_SAMPLES)  # колесо не может вызвать копирование > ёмкости буфера
-            return self._buffer.get_last(n)
+            window = TIME_DIV_SEQ[self._time_div_idx] * N_DIV
+            return self._buffer.get_recent_lod(window, MAX_DISPLAY_PTS)
         else:
+            # Не копировать всё кольцо на каждый кадр: на большом блоке это вешало навигацию.
             vr   = self._plot.plotItem.getViewBox().viewRange()[0]
             t_lo = float(vr[0])
             t_hi = float(vr[1])
-            t, v = self._buffer.get_last(self._buffer.size)
+            pad  = 2.0 / max(self._sample_rate, 1.0)
+            t, v = self._buffer.get_window_lod(t_lo - pad, t_hi + pad, MAX_DISPLAY_PTS)
             if len(t) < 2:
                 return None, None
-            i0 = max(0, int(np.searchsorted(t, t_lo)) - 1)
-            i1 = min(len(t), int(np.searchsorted(t, t_hi)) + 2)
-            if i0 >= i1:
-                return None, None
-            return t[i0:i1], v[i0:i1]
+            return t, v
 
     # ------------------------------------------------------------------
     # Отрисовка
@@ -1475,7 +1239,6 @@ class PlotArea(QWidget):
             t_max = float(t[-1])
             w     = TIME_DIV_SEQ[self._time_div_idx] * N_DIV
             self._set_x_range(t_max - w, t_max)
-            self._pin_markers_to_view()
 
         # Обзор реже
         self._ov_tick += 1
@@ -1494,11 +1257,10 @@ class PlotArea(QWidget):
             else:
                 t_ov, v_ov = t_all, v_all
         elif self._buffer is not None and self._buffer.size >= 2:
-            t_all, v_all = self._buffer.get()
-            if len(t_all) > MAX_OVERVIEW_PTS:
-                t_ov, v_ov = _lod_decimate(t_all, v_all, MAX_OVERVIEW_PTS)
-            else:
-                t_ov, v_ov = t_all, v_all
+            bounds = self._buffer.time_bounds()
+            if bounds is None:
+                return
+            t_ov, v_ov = self._buffer.get_window_lod(bounds[0], bounds[1], MAX_OVERVIEW_PTS)
         else:
             return
 
