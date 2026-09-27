@@ -111,6 +111,7 @@ class ComAsciiDialog(QDialog):
         # ── Параметры порта ──────────────────────────────────────────
         grp = QGroupBox('Параметры порта')
         form = QFormLayout(grp)
+        self._port_form = form
         form.setSpacing(5)
         form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
 

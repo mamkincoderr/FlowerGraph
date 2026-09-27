@@ -60,7 +60,7 @@ APP_NAME    = 'FlowerGraph'
 # Релиз: поднять последнюю компоненту, закоммитить, повесить тег v<APP_VERSION>
 # (`git tag v0.7.2.123 && git push origin v0.7.2.123`) — CI extract-version
 # вытащит её регуляркой, так назовёт артефакты и GitHub Release.
-APP_VERSION = '0.7.5.2'
+APP_VERSION = '0.7.5.3'
 
 
 def _build_number() -> str:
