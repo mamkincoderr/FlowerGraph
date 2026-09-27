@@ -36,7 +36,9 @@ def save(session: Session, path: str | Path) -> None:
     }
 
     tmp = path.with_suffix(path.suffix + '.tmp')
-    with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(
+        tmp, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=1
+    ) as zf:
         zf.writestr('_meta.json', json.dumps(meta, ensure_ascii=False))
 
         for i, block in enumerate(session.blocks):
@@ -56,8 +58,10 @@ def save(session: Session, path: str | Path) -> None:
                 ],
             }
             zf.writestr(f'b{i}_meta.json', json.dumps(bm, ensure_ascii=False))
-            zf.writestr(f'b{i}_times.npy',  _arr_to_bytes(block.times.astype(np.float64)))
-            zf.writestr(f'b{i}_values.npy', _arr_to_bytes(block.values.astype(np.float32)))
+            with zf.open(f'b{i}_times.npy', 'w') as member:
+                np.save(member, block.times.astype(np.float64, copy=False), allow_pickle=False)
+            with zf.open(f'b{i}_values.npy', 'w') as member:
+                np.save(member, block.values.astype(np.float32, copy=False), allow_pickle=False)
 
     os.replace(tmp, path)
     session.file_path = str(path)

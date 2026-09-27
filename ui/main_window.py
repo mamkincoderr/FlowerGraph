@@ -15,6 +15,7 @@ MainWindow — главное окно FlowerGraph.
 
 import os
 import sys
+import threading
 import time
 import tempfile
 from enum import Enum, auto
@@ -28,7 +29,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QFileDialog, QInputDialog,
     QSystemTrayIcon, QMenu,
 )
-from PySide6.QtCore import QSize, QTimer, Qt
+from PySide6.QtCore import QSize, QTimer, Qt, QObject, QThread, Signal
 from PySide6.QtGui import QAction, QKeySequence
 
 from core.config import config
@@ -36,6 +37,9 @@ from core.app_icon import app_icon
 from core.session import Session, Block, ChannelInfo, Annotation
 from core import file_io
 from core import calib_file
+from core.recording_writer import RecordingWriter
+from core.recording_reader import read_recording_window
+from core.timebase import lod_indices
 from ui.export_dialog import ExportCsvDialog, export_csv
 from ui.plot_area import (PlotArea, TIME_DIV_SEQ, N_DIV, fmt_time_div,
                           PLOT_STYLE_LINE, PLOT_STYLE_LINE_POINTS,
@@ -60,7 +64,23 @@ APP_NAME    = 'FlowerGraph'
 # Релиз: поднять последнюю компоненту, закоммитить, повесить тег v<APP_VERSION>
 # (`git tag v0.7.2.123 && git push origin v0.7.2.123`) — CI extract-version
 # вытащит её регуляркой, так назовёт артефакты и GitHub Release.
-APP_VERSION = '0.7.6.0'
+APP_VERSION = '0.7.6.5'
+
+
+class _SessionSaveWorker(QObject):
+    finished = Signal(str, str)
+
+    def __init__(self, session: Session, path: str):
+        super().__init__()
+        self._session = session
+        self._path = path
+
+    def run(self):
+        try:
+            file_io.save(self._session, self._path)
+            self.finished.emit(self._session.file_path or self._path, '')
+        except Exception as exc:
+            self.finished.emit(self._path, f'{type(exc).__name__}: {exc}')
 
 
 def _build_number() -> str:
@@ -123,11 +143,15 @@ class MainWindow(QMainWindow):
         # запись
         self._session           = Session()
         self._current_block_idx = -1
+        self._session_overview_signature: tuple | None = None
         self._rec_chunks_t:  list[np.ndarray] = []
         self._rec_chunks_v:  list[np.ndarray] = []
         self._rec_start_wall = 0.0
         self._rec_total_pts  = 0
         self._rec_n_channels = 0
+        self._live_overview_times = np.empty(0, dtype=np.float64)
+        self._live_overview_values = np.empty((0, 0), dtype=np.float32)
+        self._live_overview_max_points = 6000
         self._block_global_offsets: list[float] = []   # глобальные смещения блоков для NavBar
 
         # Потоковая запись во временный файл
@@ -135,6 +159,13 @@ class MainWindow(QMainWindow):
         self._tmp_v_file  = None   # открытый бинарный файл для значений
         self._tmp_t_path  = ''
         self._tmp_v_path  = ''
+        self._record_writer: RecordingWriter | None = None
+        self._recording_direct = False
+        self._record_lock = threading.Lock()
+        self._save_thread: QThread | None = None
+        self._save_worker: _SessionSaveWorker | None = None
+        self._save_signature: tuple | None = None
+        self._close_after_save = False
         self._use_streaming = True  # всегда писать на диск (экономия RAM)
         self._pending_ann: list[tuple[float, str]] = []
         self._rec_last_t = 0.0
@@ -152,6 +183,7 @@ class MainWindow(QMainWindow):
 
         # виджеты
         self._plot_area      = PlotArea()
+        self._plot_area.set_historical_data_provider(self._read_recording_window)
         self._channel_panel  = ChannelPanel()
         self._nav_bar        = NavBar()
         self._amp_scale      = AmplitudeScalePanel()
@@ -179,7 +211,7 @@ class MainWindow(QMainWindow):
 
         # NavBar → PlotArea (через MainWindow для навигации между блоками)
         self._nav_bar.navigate_to.connect(self._on_nav_navigate)
-        self._nav_bar.go_start.connect(self._plot_area.go_to_start)
+        self._nav_bar.go_start.connect(self._on_nav_go_start)
         self._nav_bar.go_end.connect(self._plot_area.go_to_end)
         self._nav_bar.page_left.connect(self._plot_area.page_left)
         self._nav_bar.page_right.connect(self._plot_area.page_right)
@@ -294,7 +326,9 @@ class MainWindow(QMainWindow):
 
         # Правая панель: настройки каналов + список блоков
         right = QWidget()
-        right.setMinimumWidth(self._channel_panel.minimumWidth())
+        # Keep the right panel collapsible down to the splitter edge.
+        right.setMinimumWidth(0)
+        right.setMinimumSize(0, 0)
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(0)
@@ -319,7 +353,11 @@ class MainWindow(QMainWindow):
         self._main_splitter.addWidget(left)
         self._main_splitter.addWidget(self._plot_area)
         self._main_splitter.addWidget(right)
+        self._right_panel = right
+        self._right_panel_width = 378
+        self._main_splitter.setCollapsible(2, True)
         self._main_splitter.setSizes([150, 700, 378])
+        self._main_splitter.splitterMoved.connect(self._on_main_splitter_moved)
 
         # Статистика + навигация: вертикальный сплиттер
         self._stats_toggle_btn = QWidget()
@@ -471,8 +509,11 @@ class MainWindow(QMainWindow):
 
         m_view.addSeparator()
         m_view.addAction(self._act_follow)
-        m_view.addAction(self._action('Панель каналов',
-                                      self._toggle_channel_panel))
+        self._act_channel_panel = self._action(
+            'Панель каналов', self._toggle_channel_panel)
+        self._act_channel_panel.setCheckable(True)
+        self._act_channel_panel.setChecked(True)
+        m_view.addAction(self._act_channel_panel)
         m_view.addSeparator()
 
         # Масштаб шкалы X — подменю со стандартными шагами (как в PG)
@@ -676,20 +717,42 @@ class MainWindow(QMainWindow):
     def _on_start(self):
         if self._state != AppState.IDLE:
             return
-        if not self._start_source():
-            QMessageBox.warning(
-                self, 'Источник',
-                'Не удалось запустить источник. Проверьте COM-порт.',
-            )
-            return
+        # A new capture starts live, at the selected fixed time scale.
+        self._nav_bar.set_paused(False)
+        self._nav_bar.set_following(True)
+        self._plot_area.set_following(True)
+        self._pause_arm = False
+        self._pause_hold = False
         self._rec_chunks_t.clear()
         self._rec_chunks_v.clear()
+        self._live_overview_times = np.empty(0, dtype=np.float64)
+        self._live_overview_values = np.empty((0, 0), dtype=np.float32)
+        self._plot_area.clear_historical_cache()
         self._pending_ann.clear()
         self._rec_last_t = 0.0
         self._rec_start_wall = time.time()
         self._rec_total_pts  = 0
         self._rec_n_channels = 0
         self._open_tmp_files()
+        if (self._tmp_t_file is not None and self._tmp_v_file is not None
+                and self._source_type in (
+                    SourceType.COM_ASCII, SourceType.COM_COBS,
+                    SourceType.COM_MCOBS,
+                )):
+            self._record_writer = RecordingWriter(
+                self._tmp_t_file, self._tmp_v_file
+            )
+        if not self._start_source():
+            if self._record_writer is not None:
+                self._record_writer.close()
+                self._record_writer = None
+            self._recording_direct = False
+            self._close_tmp_files(remove=True)
+            QMessageBox.warning(
+                self, 'Источник',
+                'Не удалось запустить источник. Проверьте COM-порт.',
+            )
+            return
         interval_min = config.get('autosave_interval_min', default=5)
         self._autosave_timer.start(int(interval_min * 60 * 1000))
         self._rec_timer.start(1000)
@@ -774,12 +837,26 @@ class MainWindow(QMainWindow):
 
         if self._source:
             self._source.stop()
+        writer_error = None
+        if self._record_writer is not None:
+            writer_error = self._record_writer.close()
+            self._record_writer = None
+        self._recording_direct = False
         self._plot_area.stop()
 
         has_data = (self._rec_total_pts > 0)
         self._pause_hold = True
         try:
-            if was_recording and has_data:
+            if writer_error:
+                self._close_tmp_files(remove=False)
+                QMessageBox.critical(
+                    self, 'Ошибка записи',
+                    'Фоновая запись завершилась с ошибкой; блок не добавлен, '
+                    'чтобы не принять неполные данные за целые.\n\n'
+                    f'{writer_error}\n\n'
+                    f'Временные файлы сохранены:\n{self._tmp_t_path}\n{self._tmp_v_path}',
+                )
+            elif was_recording and has_data:
                 self._finalize_block(keep_view=True)
             elif was_recording:
                 self._close_tmp_files(remove=True)
@@ -826,6 +903,11 @@ class MainWindow(QMainWindow):
 
         src.set_data_callback(self._on_data)
         src.set_error_callback(self._on_source_error)
+        self._recording_direct = isinstance(
+            src, (ComAsciiSource, ComCobsSource, ComMCobsSource)
+        )
+        if self._recording_direct:
+            src.set_record_callback(self._record_source_data)
 
         ok = src.start()
         src._drain_errors()
@@ -892,11 +974,13 @@ class MainWindow(QMainWindow):
         names  = src.get_channel_names()
         n      = src.get_channel_count()
         self._plot_area.setup(n_channels=n, names=names, sample_rate=sample_rate)
+        self._live_overview_times = np.empty(0, dtype=np.float64)
+        self._live_overview_values = np.empty((0, n), dtype=np.float32)
         # setup включает слежение. Пауза — отдельная защёлка и переживает Старт.
-        paused = self._nav_bar.is_paused()
-        self._plot_area.set_following(not paused)
-        # Новый поток со своей шкалой времени. Первый пакет поставит окно на его начало.
-        self._pause_arm = paused
+        self._nav_bar.set_paused(False)
+        self._nav_bar.set_following(True)
+        self._plot_area.set_following(True)
+        self._pause_arm = False
         colors = self._plot_area.get_channel_colors()
         self._channel_panel.setup(names, colors)
         self._nav_bar.setup_channels(n, colors)
@@ -904,6 +988,51 @@ class MainWindow(QMainWindow):
         self._stats_panel.setup(names, colors)
         self._restore_channel_visibility(n)
         self._block_global_offsets = []   # сбросить — live-режим не использует смещения
+
+    def _append_live_overview(self, times: np.ndarray, values: np.ndarray):
+        if not len(times) or values.ndim != 2 or not values.shape[1]:
+            return
+        batch_limit = max(2 * values.shape[1] + 2, 32)
+        idx = lod_indices(values, min(len(values), batch_limit))
+        times_new = np.asarray(times[idx], dtype=np.float64)
+        values_new = np.asarray(values[idx], dtype=np.float32)
+        if (self._live_overview_values.ndim != 2
+                or self._live_overview_values.shape[1] != values_new.shape[1]):
+            self._live_overview_times = np.empty(0, dtype=np.float64)
+            self._live_overview_values = np.empty(
+                (0, values_new.shape[1]), dtype=np.float32
+            )
+        all_times = np.concatenate((self._live_overview_times, times_new))
+        all_values = np.concatenate((self._live_overview_values, values_new), axis=0)
+        if len(all_times) > self._live_overview_max_points:
+            keep = max(2, self._live_overview_max_points // 2)
+            reduce_idx = lod_indices(all_values, keep)
+            all_times = all_times[reduce_idx]
+            all_values = all_values[reduce_idx]
+        self._live_overview_times = all_times
+        self._live_overview_values = all_values
+
+    def _read_recording_window(
+        self, t_lo: float, t_hi: float, max_points: int
+    ):
+        if (self._state != AppState.RECORDING
+                or not self._tmp_t_path or not self._tmp_v_path
+                or self._rec_n_channels <= 0):
+            return None
+        try:
+            if self._record_writer is not None:
+                if not self._record_writer.flush(wait=True):
+                    return None
+            else:
+                for stream in (self._tmp_t_file, self._tmp_v_file):
+                    if stream is not None:
+                        stream.flush()
+            return read_recording_window(
+                self._tmp_t_path, self._tmp_v_path, self._rec_n_channels,
+                t_lo, t_hi, max_points,
+            )
+        except (OSError, ValueError):
+            return None
 
     def _on_data(self, times: np.ndarray, values: np.ndarray):
         # Авто-инициализация UI при первом пакете от COM-источника
@@ -918,14 +1047,16 @@ class MainWindow(QMainWindow):
             self._lbl_source.setText(f'Источник: {self._source.get_name()}')
 
         self._plot_area.push_data(times, values)
+        if self._state == AppState.RECORDING:
+            self._append_live_overview(times, values)
         if self._pause_arm:
             self._pause_arm = False
             if self._nav_bar.is_paused() and len(times):
                 w = TIME_DIV_SEQ[self._plot_area.time_div_idx] * N_DIV
                 t0 = float(times[0])
                 self._plot_area.restore_paused_view(t0, t0 + w, self._plot_area.time_div_idx)
-        self._pkt_count += 1
-        if self._state == AppState.RECORDING:
+        self._pkt_count += len(times)
+        if self._state == AppState.RECORDING and not self._recording_direct:
             if not self._rec_n_channels:
                 self._rec_n_channels = values.shape[1]
             if self._tmp_t_file is not None and self._tmp_v_file is not None:
@@ -934,6 +1065,22 @@ class MainWindow(QMainWindow):
             else:
                 self._rec_chunks_t.append(times.copy())
                 self._rec_chunks_v.append(values.copy())
+            self._rec_total_pts += len(times)
+            self._rec_last_t = float(times[-1])
+
+    def _record_source_data(self, times: np.ndarray, values: np.ndarray):
+        """Capture COM samples on the acquisition thread, independent of GUI load."""
+        if not len(times):
+            return
+        with self._record_lock:
+            if self._record_writer is not None:
+                if not self._record_writer.submit(times, values):
+                    raise OSError(self._record_writer.error or 'recording writer stopped')
+            else:
+                self._rec_chunks_t.append(times.copy())
+                self._rec_chunks_v.append(values.copy())
+            if not self._rec_n_channels:
+                self._rec_n_channels = values.shape[1]
             self._rec_total_pts += len(times)
             self._rec_last_t = float(times[-1])
 
@@ -1012,6 +1159,9 @@ class MainWindow(QMainWindow):
 
     def _autosave(self):
         if self._state == AppState.RECORDING:
+            if self._record_writer is not None:
+                self._record_writer.flush(wait=False)
+                return
             for f in (self._tmp_t_file, self._tmp_v_file):
                 try:
                     if f:
@@ -1020,10 +1170,7 @@ class MainWindow(QMainWindow):
                     pass
             return
         if self._session.file_path:
-            try:
-                file_io.save(self._session, self._session.file_path)
-            except Exception:
-                pass
+            self._schedule_save(self._session.file_path, autosave=True)
 
     # ==================================================================
     # Файловые операции
@@ -1045,6 +1192,8 @@ class MainWindow(QMainWindow):
         if self._session.n_blocks > 0:
             self._current_block_idx = 0
             self._display_block(0)   # внутри вызывает _update_session_overview()
+        else:
+            self._update_session_overview()
 
     def _on_import_pgc(self):
         path, _ = QFileDialog.getOpenFileName(self, 'Импорт .pgc', '', PGC_FILTER)
@@ -1075,15 +1224,91 @@ class MainWindow(QMainWindow):
         return self._do_save(path)
 
     def _do_save(self, path: str) -> bool:
-        try:
-            file_io.save(self._session, path)
-            config.add_recent_file(self._session.file_path)
-            self._update_recent_menu()
-            self._update_title()
-            return True
-        except Exception as e:
-            QMessageBox.critical(self, 'Ошибка сохранения', str(e))
+        return self._schedule_save(path)
+
+    def _session_signature(self) -> tuple:
+        return tuple(
+            (
+                id(block), id(block.times), id(block.values),
+                block.start_time, block.source_name, block.sample_rate,
+                block.description,
+                tuple((ch.name, ch.unit, ch.scale, ch.offset) for ch in block.channels),
+                tuple((ann.t, ann.text) for ann in block.annotations),
+            )
+            for block in self._session.blocks
+        )
+
+    def _session_snapshot(self) -> Session:
+        blocks = []
+        for block in self._session.blocks:
+            blocks.append(Block(
+                index=block.index,
+                start_time=block.start_time,
+                source_name=block.source_name,
+                sample_rate=block.sample_rate,
+                channels=[ChannelInfo(ch.name, ch.unit, ch.scale, ch.offset)
+                          for ch in block.channels],
+                times=block.times,
+                values=block.values,
+                description=block.description,
+                annotations=[Annotation(ann.t, ann.text) for ann in block.annotations],
+            ))
+        return Session(
+            created=self._session.created,
+            blocks=blocks,
+            file_path=self._session.file_path,
+            modified=self._session.modified,
+        )
+
+    def _schedule_save(self, path: str, *, autosave: bool = False) -> bool:
+        if self._save_thread is not None:
+            if not autosave:
+                self.statusBar().showMessage('Save is already in progress', 3000)
             return False
+
+        snapshot = self._session_snapshot()
+        signature = self._session_signature()
+        thread = QThread(self)
+        worker = _SessionSaveWorker(snapshot, path)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_save_finished)
+        thread.finished.connect(worker.deleteLater)
+        self._save_thread = thread
+        self._save_worker = worker
+        self._save_signature = signature
+        thread.start()
+        if not autosave:
+            self.statusBar().showMessage('Saving...')
+        return True
+
+    def _on_save_finished(self, path: str, error: str):
+        thread = self._save_thread
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            thread.deleteLater()
+        self._save_thread = None
+        self._save_worker = None
+
+        if error:
+            self._close_after_save = False
+            self._save_signature = None
+            QMessageBox.critical(self, 'Save failed', error)
+            self.statusBar().showMessage('Save failed', 5000)
+            return
+
+        self._session.file_path = path
+        if self._session_signature() == self._save_signature:
+            self._session.modified = False
+        self._save_signature = None
+        config.add_recent_file(path)
+        self._update_recent_menu()
+        self._update_title()
+        self.statusBar().showMessage(f'Saved: {path}', 5000)
+        if self._close_after_save:
+            self._close_after_save = False
+            self.close()
 
     # ==================================================================
     # Навигация по блокам
@@ -1116,10 +1341,22 @@ class MainWindow(QMainWindow):
         """Собрать сводный обзор всех блоков сессии и отобразить в NavBar."""
         n = self._session.n_blocks
         if n == 0:
+            self._session_overview_signature = ()
+            self._block_global_offsets = []
+            self._nav_bar.setup_channels(0, [])
+            self._nav_bar.set_segments([])
             return
 
-        MAX_PTS = 1500
-        pts_per_block = max(50, MAX_PTS // n)
+        signature = tuple(
+            (id(block), block.n_samples, block.n_channels, block.t_start, block.t_end)
+            for block in self._session.blocks
+        )
+        if signature == self._session_overview_signature:
+            self._nav_bar.set_active_segment(self._current_block_idx)
+            return
+
+        max_pts = 1800
+        pts_per_block = max(2, max_pts // n)
 
         # Глобальные смещения: блоки укладываются встык с зазором 0.5 с
         offsets = [0.0]
@@ -1135,28 +1372,39 @@ class MainWindow(QMainWindow):
         # Пересоздать кривые NavBar с нужным числом каналов
         self._nav_bar.setup_channels(n_ch_max, colors)
 
-        all_times  = []
+        all_times = []
         all_values = []
+        segments = []
         for i, block in enumerate(self._session.blocks):
             t = block.times.astype(np.float64)
             v = block.values.astype(np.float32)
-            step  = max(1, len(t) // pts_per_block)
-            t_dec = t[::step]
-            v_dec = v[::step]
+            indices = lod_indices(v, pts_per_block)
+            t_dec = t[indices]
+            v_dec = v[indices]
             # Переводим локальное время в глобальное
             t_global = t_dec - float(block.t_start) + offsets[i]
-            all_times.append(t_global)
+            if i:
+                gap_mid = (offsets[i - 1] + self._session.blocks[i - 1].duration
+                           + offsets[i]) / 2.0
+                all_times.append(np.asarray([gap_mid], dtype=np.float64))
+                all_values.append(
+                    np.full((1, n_ch_max), np.nan, dtype=np.float32)
+                )
             # Дополняем NaN если число каналов меньше максимума
             if v_dec.shape[1] < n_ch_max:
                 pad   = np.full((len(v_dec), n_ch_max - v_dec.shape[1]),
                                 np.nan, dtype=np.float32)
                 v_dec = np.hstack([v_dec, pad])
+            all_times.append(t_global)
             all_values.append(v_dec)
+            segments.append((offsets[i], offsets[i] + block.duration, block.n_samples))
 
-        combined_t = np.concatenate(all_times)
-        combined_v = np.concatenate(all_values)
+        combined_t = np.concatenate(all_times) if all_times else np.empty(0)
+        combined_v = (np.concatenate(all_values) if all_values
+                      else np.empty((0, n_ch_max), dtype=np.float32))
         self._nav_bar.update_overview(combined_t, combined_v)
-        self._nav_bar.mark_blocks(offsets)
+        self._nav_bar.set_segments(segments, self._current_block_idx)
+        self._session_overview_signature = signature
 
         # Синхронизировать регион с текущим видом
         try:
@@ -1174,11 +1422,47 @@ class MainWindow(QMainWindow):
     def _on_plot_overview_ready(self, times: np.ndarray, values: np.ndarray):
         """Live-обзор из кольцевого буфера PlotArea — только в активном режиме."""
         if self._state in (AppState.MONITORING, AppState.RECORDING):
-            self._nav_bar.update_overview(times, values)
+            if (self._state == AppState.RECORDING
+                    and len(self._live_overview_times)):
+                overview_times = self._live_overview_times
+                overview_values = self._live_overview_values
+                x_bounds = (0.0, max(1e-9, float(overview_times[-1])))
+            else:
+                overview_times, overview_values = times, values
+                x_bounds = None
+            self._nav_bar.update_overview(
+                overview_times, overview_values, x_bounds=x_bounds
+            )
+            if self._plot_area._following:
+                view = self._plot_area._plot.plotItem.getViewBox().viewRange()[0]
+                self._nav_bar.set_view_region(float(view[0]), float(view[1]))
 
     def _on_view_range_changed(self, t0: float, t1: float):
         """Трансляция диапазона вида PlotArea в координаты NavBar."""
         if self._state in (AppState.MONITORING, AppState.RECORDING):
+            if not self._plot_area._following:
+                if (self._state == AppState.RECORDING
+                        and len(self._live_overview_times)):
+                    bounds = (0.0, float(self._live_overview_times[-1]))
+                else:
+                    bounds = (self._plot_area._buffer.time_bounds()
+                              if self._plot_area._buffer is not None else None)
+                if bounds is not None:
+                    lo, hi = bounds
+                    width = max(0.0, float(t1) - float(t0))
+                    available = max(0.0, hi - lo)
+                    if width <= available:
+                        left = min(max(float(t0), lo), hi - width)
+                    else:
+                        # Keep the chosen time scale while showing all data
+                        # that has not yet rolled out of the live buffer.
+                        left = (lo + hi - width) / 2.0
+                    clamped = (left, left + width)
+                    tolerance = max(1e-9, width * 1e-9)
+                    if (abs(float(t0) - clamped[0]) > tolerance
+                            or abs(float(t1) - clamped[1]) > tolerance):
+                        self._plot_area.set_view_range(*clamped)
+                        t0, t1 = clamped
             self._nav_bar.set_view_region(t0, t1)
         else:
             # Статический режим: пересчитать в глобальные координаты
@@ -1187,12 +1471,21 @@ class MainWindow(QMainWindow):
                 return
             idx    = self._current_block_idx
             offset = self._current_block_offset()
-            t_start_local = float(self._session.blocks[idx].t_start) if (
-                0 <= idx < self._session.n_blocks) else 0.0
-            self._nav_bar.set_view_region(
-                t0 - t_start_local + offset,
-                t1 - t_start_local + offset,
+            if not (0 <= idx < self._session.n_blocks):
+                self._nav_bar.set_view_region(t0 + offset, t1 + offset)
+                return
+            block = self._session.blocks[idx]
+            segment_start = offset
+            segment_end = offset + max(
+                block.duration, 1.0 / max(1, block.sample_rate)
             )
+            local_origin = float(block.t_start)
+            requested_start = t0 - local_origin + offset
+            requested_end = t1 - local_origin + offset
+            width = min(max(0.0, requested_end - requested_start),
+                        segment_end - segment_start)
+            left = min(max(requested_start, segment_start), segment_end - width)
+            self._nav_bar.set_view_region(left, left + width)
 
     def _on_nav_navigate(self, global_t0: float, global_t1: float):
         """Навигация из NavBar: блок выбирается по центру окна, масштаб не сбрасывается."""
@@ -1203,23 +1496,51 @@ class MainWindow(QMainWindow):
             self._plot_area.set_view_range(global_t0, global_t1)
             return
 
-        blocks  = self._session.blocks
+        blocks = self._session.blocks
         offsets = self._block_global_offsets
-        center  = (global_t0 + global_t1) / 2.0
-        target  = len(offsets) - 1
-        for i in range(len(offsets) - 1):
-            if center < offsets[i + 1]:
-                target = i
-                break
+        center = (global_t0 + global_t1) / 2.0
+
+        def block_span(index: int) -> float:
+            block = blocks[index]
+            if block.duration > 0:
+                return block.duration
+            return 1.0 / max(1, block.sample_rate)
+
+        def distance_to_block(index: int) -> float:
+            start = offsets[index]
+            end = start + block_span(index)
+            return max(start - center, 0.0, center - end)
+
+        # Таймлайн содержит пустые промежутки между блоками. Щелчок в таком
+        # промежутке привязываем к ближайшему реальному блоку.
+        target = min(range(len(blocks)), key=distance_to_block)
 
         if target != self._current_block_idx:
             self._display_block(target, fit=False)
+        else:
+            self._nav_bar.set_active_segment(target)
 
         offset        = offsets[target]
         t_start_local = float(blocks[target].t_start)
-        local_t0      = global_t0 - offset + t_start_local
-        local_t1      = global_t1 - offset + t_start_local
+        span = block_span(target)
+        width = min(max(0.0, global_t1 - global_t0), span)
+        if width <= 0:
+            width = span
+        left = center - width / 2.0
+        left = min(max(left, offset), offset + span - width)
+        local_t0 = left - offset + t_start_local
+        local_t1 = local_t0 + width
         self._plot_area.set_view_range(local_t0, local_t1)
+
+    def _on_nav_go_start(self):
+        if (self._state == AppState.RECORDING
+                and len(self._live_overview_times)):
+            width = TIME_DIV_SEQ[self._plot_area.time_div_idx] * N_DIV
+            self._plot_area.set_following(False)
+            self._plot_area.set_view_range(0.0, width)
+            self._nav_bar.set_view_region(0.0, width)
+            return
+        self._plot_area.go_to_start()
 
     def _on_find_block(self):
         """Перейти к началу текущего блока без смены масштаба."""
@@ -1441,6 +1762,7 @@ class MainWindow(QMainWindow):
         self._act_follow.blockSignals(True)
         self._act_follow.setChecked(following)
         self._act_follow.blockSignals(False)
+        self._nav_bar.set_following(following)
         # Пока Стоп собирает блок, слежение гаснет само. Защёлку паузы это не меняет.
         if self._pause_hold:
             return
@@ -1476,8 +1798,11 @@ class MainWindow(QMainWindow):
         # Сброс всего
         self._session           = Session()
         self._current_block_idx = -1
+        self._session_overview_signature = None
+        self._block_global_offsets = []
         self._plot_area.clear_everything()
         self._nav_bar.setup_channels(0, [])
+        self._nav_bar.set_segments([])
         self._channel_visible = []
         self._channel_panel.setup([], [])
         self._amp_scale.setup([], [])
@@ -1544,9 +1869,28 @@ class MainWindow(QMainWindow):
         self._act_auto_y.setChecked(True)
 
     def _toggle_channel_panel(self):
-        self._channel_panel.parent().setVisible(
-            not self._channel_panel.parent().isVisible()
-        )
+        sizes = self._main_splitter.sizes()
+        visible = sizes[2] <= 0
+        total_right_space = sizes[1] + sizes[2]
+        if visible:
+            width = min(self._right_panel_width, max(140, total_right_space // 3))
+            self._main_splitter.setSizes([sizes[0], total_right_space - width, width])
+        else:
+            self._right_panel_width = sizes[2]
+            self._main_splitter.setSizes([sizes[0], total_right_space, 0])
+        if self._act_channel_panel.isChecked() != visible:
+            self._act_channel_panel.setChecked(visible)
+
+    def _on_main_splitter_moved(self, _position: int, _index: int):
+        sizes = self._main_splitter.sizes()
+        if len(sizes) < 3:
+            return
+        visible = sizes[2] > 0
+        if visible:
+            self._right_panel_width = sizes[2]
+        action = getattr(self, '_act_channel_panel', None)
+        if action is not None and action.isChecked() != visible:
+            action.setChecked(visible)
 
     def _on_stats_toggle(self, checked: bool):
         self._stats_panel.setVisible(checked)
@@ -1688,6 +2032,8 @@ class MainWindow(QMainWindow):
             if self._session.n_blocks > 0:
                 self._current_block_idx = 0
                 self._display_block(0)
+            else:
+                self._update_session_overview()
         except Exception as e:
             QMessageBox.critical(self, 'Ошибка', str(e))
 
@@ -2062,6 +2408,10 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        if self._save_thread is not None:
+            self._close_after_save = True
+            event.ignore()
+            return
         if self._state != AppState.IDLE:
             self._on_stop()
         if self._session.modified:
@@ -2075,6 +2425,10 @@ class MainWindow(QMainWindow):
                 return
             if r == QMessageBox.Yes:
                 if not self._on_save():
+                    event.ignore()
+                    return
+                if self._save_thread is not None:
+                    self._close_after_save = True
                     event.ignore()
                     return
         geo = self.geometry()

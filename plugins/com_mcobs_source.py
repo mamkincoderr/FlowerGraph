@@ -104,6 +104,8 @@ class ComMCobsSource(BaseSource):
         self._pkt_err_cobs = 0
         self._pkt_err_crc  = 0
         self._pkt_lost     = 0
+        self._gui_queue_drops = 0
+        self._gui_queue_drops_reported = 0
         self._t_start      = 0.0
         self._sample_count = 0
 
@@ -157,6 +159,8 @@ class ComMCobsSource(BaseSource):
         self._pkt_err_cobs   = 0
         self._pkt_err_crc    = 0
         self._pkt_lost       = 0
+        self._gui_queue_drops = 0
+        self._gui_queue_drops_reported = 0
         self._n_ch_detected  = self._config.n_channels
         self._batch_detected = 0
         self._last_count     = -1
@@ -175,12 +179,12 @@ class ComMCobsSource(BaseSource):
     def stop(self):
         self._running = False
         self._drain_timer.stop()
-        if self._thread:
-            self._thread.join(timeout=0.5)
-            self._thread = None
         if self._port and self._port.is_open:
             try: self._port.close()
             except Exception: pass
+        if self._thread:
+            self._thread.join()
+            self._thread = None
         self._port = None
         self._drain_queue()
 
@@ -317,15 +321,19 @@ class ComMCobsSource(BaseSource):
         # COUNT / потери
         if self._config.has_count:
             count = raw[0]
+            lost_packets = 0
             if self._last_count >= 0:
                 expected = (self._last_count + 1) & 0xFF
                 if count != expected:
                     lost = (count - expected) & 0xFF
                     self._pkt_lost += lost
+                    lost_packets = lost
                     self._emit_error(
                         f'mCOBS: потеряно {lost} пакетов '
                         f'(ожидался {expected}, получен {count})')
             self._last_count = count
+        else:
+            lost_packets = 0
 
         # Данные
         sfmt    = _STRUCT_FMT[self._config.data_format]
@@ -342,6 +350,7 @@ class ComMCobsSource(BaseSource):
         if self._sample_count == 0:
             self._t_start = time.perf_counter()
 
+        self._sample_count += lost_packets * batch
         t0    = self._t_base + self._sample_count / self._rate_est
         dt    = 1.0 / self._rate_est
         times = np.array([t0 + k * dt for k in range(batch)], dtype=np.float64)
@@ -350,19 +359,23 @@ class ComMCobsSource(BaseSource):
         if self._sample_count % self._RECAL_AT < batch:
             self._calibrate_rate()
 
-        put_drop_oldest(self._queue, (times, values_batch))
+        self._record(times, values_batch)
+        if put_drop_oldest(self._queue, (times, values_batch)):
+            self._gui_queue_drops += 1
         self._pkt_ok += 1
 
     # ------------------------------------------------------------------
 
     def _drain_queue(self):
         self._drain_errors()
-        while True:
-            try:
-                times, values = self._queue.get_nowait()
-                self._emit(times, values)
-            except queue.Empty:
-                break
+        self._drain_data_queue(self._queue)
+        if self._gui_queue_drops > self._gui_queue_drops_reported:
+            dropped = self._gui_queue_drops - self._gui_queue_drops_reported
+            self._gui_queue_drops_reported = self._gui_queue_drops
+            self._emit_error(
+                f'mCOBS: график пропустил {dropped} пакетов из-за перегрузки; '
+                'поток записи сохраняется отдельно'
+            )
 
     @property
     def stats(self) -> dict:
@@ -373,6 +386,7 @@ class ComMCobsSource(BaseSource):
             'pkt_ok': self._pkt_ok,
             'pkt_err_cobs': self._pkt_err_cobs, 'pkt_err_crc': self._pkt_err_crc,
             'pkt_lost': self._pkt_lost,
+            'gui_queue_drops': self._gui_queue_drops,
             'sample_rate': int(self._rate_est), 'elapsed': elapsed,
         }
 

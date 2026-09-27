@@ -40,7 +40,10 @@ def time_div_idx_for_span(span: float) -> int:
         return DEFAULT_IDX
     needed = span / N_DIV
     for i, t in enumerate(TIME_DIV_SEQ):
-        if t >= needed:
+        # X ranges are doubles; a nominal 10 * 20 us may return as
+        # 0.000200000000006 instead of 0.0002. Treat near-equality as equal
+        # so zooming does not skip that grid step.
+        if t >= needed or np.isclose(t, needed, rtol=1e-9, atol=0.0):
             return i
     return len(TIME_DIV_SEQ) - 1
 
@@ -93,6 +96,49 @@ def lod_indices(v: np.ndarray, max_pts: int) -> np.ndarray:
     idx_max = base + bins.argmax(axis=1)
     indices = np.concatenate((idx_min.ravel(), idx_max.ravel(), [0, n - 1]))
     return np.unique(np.clip(indices, 0, n - 1))
+
+
+def mark_time_gaps(times: np.ndarray, values: np.ndarray, sample_rate: float,
+                   previous_time: float | None = None
+                   ) -> tuple[np.ndarray, np.ndarray, float | None]:
+    """Insert NaN rows where uniformly sampled data has a missing interval."""
+    if len(times) == 0:
+        return times, values, previous_time
+
+    rate = float(sample_rate)
+    if not np.isfinite(rate) or rate <= 0:
+        return times, values, float(times[-1])
+    max_step = 1.5 / rate
+    internal = np.flatnonzero(np.diff(times) > max_step) + 1
+    boundary_gap = (
+        previous_time is not None
+        and float(times[0]) - previous_time > max_step
+    )
+    if not boundary_gap and len(internal) == 0:
+        return times, values, float(times[-1])
+
+    marker_count = len(internal) + int(boundary_gap)
+    out_times = np.empty(len(times) + marker_count, dtype=np.float64)
+    out_values = np.empty(
+        (len(values) + marker_count, values.shape[1]), dtype=np.float32
+    )
+    out_values[:] = np.nan
+
+    src_i = 0
+    dst_i = 0
+    if boundary_gap:
+        out_times[dst_i] = (previous_time + float(times[0])) / 2.0
+        dst_i += 1
+    gap_set = set(map(int, internal))
+    for src_i, (t, row) in enumerate(zip(times, values)):
+        if src_i in gap_set:
+            out_times[dst_i] = (float(times[src_i - 1]) + float(t)) / 2.0
+            dst_i += 1
+        out_times[dst_i] = t
+        out_values[dst_i] = row
+        dst_i += 1
+
+    return out_times, out_values, float(times[-1])
 
 
 def lod_decimate(t: np.ndarray, v: np.ndarray, max_pts: int):

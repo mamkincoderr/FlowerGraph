@@ -143,14 +143,14 @@ class ComAsciiSource(BaseSource):
     def stop(self):
         self._running = False
         self._drain_timer.stop()
-        if self._thread:
-            self._thread.join(timeout=0.5)
-            self._thread = None
         if self._port and self._port.is_open:
             try:
                 self._port.close()
             except Exception:
                 pass
+        if self._thread:
+            self._thread.join()
+            self._thread = None
         self._port = None
         # Сливаем остаток
         self._drain_queue()
@@ -305,6 +305,7 @@ class ComAsciiSource(BaseSource):
             self._calibrate_rate()
 
         times = np.array([t], dtype=np.float64)
+        self._record(times, values)
         put_drop_oldest(self._queue, (times, values))
         self._pkt_ok += 1
 
@@ -314,12 +315,7 @@ class ComAsciiSource(BaseSource):
 
     def _drain_queue(self):
         self._drain_errors()
-        while True:
-            try:
-                times, values = self._queue.get_nowait()
-                self._emit(times, values)
-            except queue.Empty:
-                break
+        self._drain_data_queue(self._queue)
 
     # ------------------------------------------------------------------
     # Статистика

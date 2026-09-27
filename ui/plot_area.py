@@ -10,6 +10,7 @@ PlotArea — основная область графиков (без обзор
 """
 
 import types
+import time
 
 import numpy as np
 import pyqtgraph as pg
@@ -23,7 +24,7 @@ from core.timebase import (
     TIME_DIV_SEQ, N_DIV, DEFAULT_IDX,
     max_div_idx_for_span, time_div_idx_for_span,
     Y_DIV_SEQ, Y_DIV_DEFAULT_IDX, fmt_y_div, fmt_time_div,
-    lod_decimate as _lod_decimate,
+    lod_decimate as _lod_decimate, mark_time_gaps,
 )
 
 
@@ -51,7 +52,7 @@ MAX_RING_SAMPLES   = 300_000  # ≤ 300 к отсчётов, окно не ра�
 MIN_RING_SEC       = 5        # минимум 5 секунд в кольцевом буфере
 MAX_LIVE_OV_PTS    = 2_000    # точек в быстром обзорном буфере (LIVE режим)
 DEFAULT_FPS        = 25
-MAX_DISPLAY_PTS    = 8000
+MAX_DISPLAY_PTS    = 2500
 MAX_OVERVIEW_PTS   = 1500
 OV_UPDATE_TICKS    = 15    # ~600 мс при 25 FPS
 
@@ -81,6 +82,11 @@ class PlotArea(QWidget):
         self._static_times:  np.ndarray | None = None
         self._static_values: np.ndarray | None = None
         self._suppress_range_signal = False
+        self._historical_data_provider = None
+        self._historical_cache_key = None
+        self._historical_cache = None
+        self._historical_cache_time = 0.0
+        self._historical_last_read = 0.0
         self._active_channel = 0     # канал под управлением Ctrl+=/−
         self._mouse_proxy    = None  # SignalProxy для отслеживания курсора
 
@@ -198,6 +204,7 @@ class PlotArea(QWidget):
 
     def setup(self, n_channels: int, names: list[str], sample_rate: int):
         self._timer.stop()
+        self.clear_historical_cache()
         self._n_channels  = n_channels
         self._sample_rate = sample_rate
         self._following   = True
@@ -246,7 +253,7 @@ class PlotArea(QWidget):
             c = self._plot.plot(
                 pen=pg.mkPen(color=color, width=1.5),
                 name=names[i],
-                connect='all',      # строго линейная интерполяция между точками
+                connect='finite',   # NaN-маркеры разрывов разрывают линию
                 antialias=True,
             )
             c.setDownsampling(auto=True, method='peak')
@@ -346,6 +353,23 @@ class PlotArea(QWidget):
             self._set_x_range(t0, t0 + w)
         self.time_div_changed.emit(self._time_div_idx)
 
+    def _sync_time_div_for_range(self, span: float):
+        """Bound explicit tick density to the visible time range."""
+        if not np.isfinite(span) or span <= 0:
+            return
+        idx = time_div_idx_for_span(span)
+        major = TIME_DIV_SEQ[idx]
+        # The discrete table tops out at an hour per division. For longer
+        # views, choose a larger spacing instead of drawing millions of ticks.
+        if span / major > 24:
+            major = span / 12.0
+        self._plot.getAxis('bottom').setTickSpacing(
+            major=major, minor=major / 5.0
+        )
+        if idx != self._time_div_idx:
+            self._time_div_idx = idx
+            self.time_div_changed.emit(idx)
+
     def _apply_time_div(self):
         t_div  = TIME_DIV_SEQ[self._time_div_idx]
         window = t_div * N_DIV
@@ -355,13 +379,25 @@ class PlotArea(QWidget):
         except Exception:
             pass
 
-        if (not self._static_mode and not self._following) or self._static_mode:
+        if self._static_mode or not self._following:
             vr = self._plot.plotItem.getViewBox().viewRange()[0]
             c  = (vr[0] + vr[1]) / 2
             self._static_dirty = True
             self._set_x_range(c - window / 2, c + window / 2)
+        else:
+            self._set_live_window_to_end()
 
         self.time_div_changed.emit(self._time_div_idx)
+
+    def _set_live_window_to_end(self):
+        if self._buffer is None or self._buffer.size == 0:
+            return
+        times, _ = self._buffer.get_last(1)
+        if not len(times):
+            return
+        t_max = float(times[-1])
+        width = TIME_DIV_SEQ[self._time_div_idx] * N_DIV
+        self._set_x_range(t_max - width, t_max)
 
     # ------------------------------------------------------------------
     # Навигация
@@ -400,9 +436,12 @@ class PlotArea(QWidget):
 
     def set_view_range(self, t_min: float, t_max: float):
         """Установить диапазон X из NavBar (без повторной эмиссии view_range_changed)."""
+        self._sync_time_div_for_range(abs(float(t_max) - float(t_min)))
         self._suppress_range_signal = True
-        self._plot.setXRange(t_min, t_max, padding=0)
-        self._suppress_range_signal = False
+        try:
+            self._plot.setXRange(t_min, t_max, padding=0)
+        finally:
+            self._suppress_range_signal = False
         if not self._static_mode:
             self.set_following(False)
 
@@ -779,10 +818,17 @@ class PlotArea(QWidget):
     def get_values_at(self, t: float) -> np.ndarray | None:
         t_src = self._static_times if self._static_mode else None
         v_src = self._static_values if self._static_mode else None
+        if t_src is None and not self._following and self._buffer is not None:
+            t_src, v_src = self._get_view_data()
         if t_src is None and self._buffer and self._buffer.size >= 2:
             t_src, v_src = self._buffer.get_last(min(self._buffer.size, 5000))
-        if t_src is None or len(t_src) < 2:
+        if t_src is None or len(t_src) < 2 or v_src is None:
             return None
+        finite = np.isfinite(t_src) & np.all(np.isfinite(v_src), axis=1)
+        if not np.any(finite):
+            return None
+        if not np.all(finite):
+            t_src, v_src = t_src[finite], v_src[finite]
         idx = int(np.searchsorted(t_src, t))
         idx = max(0, min(idx, len(t_src) - 1))
         raw = v_src[idx, :]
@@ -794,6 +840,16 @@ class PlotArea(QWidget):
     def set_following(self, v: bool):
         self._following = v
         self.following_changed.emit(v)
+
+    def set_historical_data_provider(self, provider):
+        self._historical_data_provider = provider
+        self.clear_historical_cache()
+
+    def clear_historical_cache(self):
+        self._historical_cache_key = None
+        self._historical_cache = None
+        self._historical_cache_time = 0.0
+        self._historical_last_read = 0.0
 
     def show_markers(self, visible: bool):
         self._markers_on = visible
@@ -897,10 +953,19 @@ class PlotArea(QWidget):
     def _find_nearest_time(self, t: float) -> float:
         """Найти время ближайшей реальной точки данных к t."""
         t_src = self._static_times if self._static_mode else None
+        v_src = self._static_values if self._static_mode else None
+        if t_src is None and not self._following and self._buffer is not None:
+            t_src, v_src = self._get_view_data()
         if t_src is None and self._buffer and self._buffer.size >= 2:
-            t_src, _ = self._buffer.get_last(
+            t_src, v_src = self._buffer.get_last(
                 min(self._buffer.size, MAX_RING_SAMPLES))
         if t_src is None or len(t_src) < 2:
+            return t
+        finite = np.isfinite(t_src)
+        if v_src is not None and len(v_src) == len(t_src):
+            finite &= np.all(np.isfinite(v_src), axis=1)
+        t_src = t_src[finite]
+        if len(t_src) < 2:
             return t
         idx = int(np.searchsorted(t_src, t))
         idx = max(0, min(idx, len(t_src) - 1))
@@ -1073,6 +1138,10 @@ class PlotArea(QWidget):
             self.following_changed.emit(False)
 
     def _on_x_range_changed(self, _vb=None, x_range=None):
+        if x_range is not None:
+            self._sync_time_div_for_range(
+                abs(float(x_range[1]) - float(x_range[0]))
+            )
         if self._static_mode:
             self._static_dirty = True   # пользователь сдвинул вид → нужен рендер
         # В следящем режиме NavBar обновляется только раз в ~600 мс (в _emit_overview),
@@ -1096,24 +1165,81 @@ class PlotArea(QWidget):
             i1   = min(len(t), int(np.searchsorted(t, t_hi)) + 2)
             if i0 >= i1:
                 return None, None
-            return t[i0:i1], self._static_values[i0:i1]
+            t_view, v_view, _ = mark_time_gaps(
+                t[i0:i1], self._static_values[i0:i1], self._sample_rate
+            )
+            return t_view, v_view
 
         if self._buffer is None or self._buffer.size < 2:
             return None, None
 
         if self._following:
             window = TIME_DIV_SEQ[self._time_div_idx] * N_DIV
-            return self._buffer.get_recent_lod(window, MAX_DISPLAY_PTS)
+            return self._buffer.get_recent_lod(window, self._display_point_limit())
         else:
             # Не копировать всё кольцо на каждый кадр: на большом блоке это вешало навигацию.
             vr   = self._plot.plotItem.getViewBox().viewRange()[0]
             t_lo = float(vr[0])
             t_hi = float(vr[1])
-            pad  = 2.0 / max(self._sample_rate, 1.0)
-            t, v = self._buffer.get_window_lod(t_lo - pad, t_hi + pad, MAX_DISPLAY_PTS)
+            pad = 2.0 / max(self._sample_rate, 1.0)
+            query_lo, query_hi = t_lo - pad, t_hi + pad
+            point_limit = self._display_point_limit()
+            ring_t, ring_v = self._buffer.get_window_lod(
+                query_lo, query_hi, point_limit
+            )
+            bounds = self._buffer.time_bounds()
+            needs_disk = (
+                bounds is not None
+                and (query_lo < bounds[0] or query_hi > bounds[1])
+                and self._historical_data_provider is not None
+            )
+            disk_t = disk_v = None
+            if needs_disk:
+                cache_key = (
+                    int(np.floor(query_lo * self._sample_rate)),
+                    int(np.ceil(query_hi * self._sample_rate)),
+                    point_limit,
+                )
+                now = time.monotonic()
+                if cache_key != self._historical_cache_key:
+                    self._historical_cache_key = cache_key
+                    self._historical_cache = None
+                    self._historical_cache_time = 0.0
+                if (self._historical_cache is not None
+                        or now - self._historical_cache_time >= 0.2):
+                    if now - self._historical_last_read < 0.08:
+                        result = self._historical_cache
+                    else:
+                        result = self._historical_data_provider(
+                            query_lo, query_hi, point_limit
+                        )
+                        self._historical_last_read = now
+                    self._historical_cache = result
+                    self._historical_cache_time = now
+                if self._historical_cache is not None:
+                    disk_t, disk_v = self._historical_cache
+
+            if disk_t is not None and len(disk_t):
+                if len(ring_t):
+                    t = np.concatenate((disk_t, ring_t))
+                    v = np.concatenate((disk_v, ring_v), axis=0)
+                else:
+                    t, v = disk_t, disk_v
+                order = np.argsort(t, kind='stable')
+                t, v = t[order], v[order]
+                unique, first = np.unique(t, return_index=True)
+                t, v = unique, v[first]
+            else:
+                t, v = ring_t, ring_v
             if len(t) < 2:
                 return None, None
+            if len(t) > point_limit:
+                t, v = _lod_decimate(t, v, point_limit)
             return t, v
+
+    def _display_point_limit(self) -> int:
+        width = max(1, self._plot.viewport().width())
+        return min(MAX_DISPLAY_PTS, max(600, width * 2))
 
     # ------------------------------------------------------------------
     # Отрисовка
@@ -1127,12 +1253,16 @@ class PlotArea(QWidget):
                 return
             self._static_dirty = False
 
+        if self._following and not self._static_mode:
+            self._set_live_window_to_end()
+
         t, v = self._get_view_data()
-        if t is None or len(t) < 2:
+        if t is None or len(t) == 0:
             return
 
-        if len(t) > MAX_DISPLAY_PTS:
-            t, v = _lod_decimate(t, v, MAX_DISPLAY_PTS)
+        point_limit = self._display_point_limit()
+        if len(t) > point_limit:
+            t, v = _lod_decimate(t, v, point_limit)
 
         for i, curve in enumerate(self._curves):
             if not self._visible[i]:
@@ -1141,11 +1271,6 @@ class PlotArea(QWidget):
             B = float(self._calib_offset[i]) if i < len(self._calib_offset) else 0.0
             y = (v[:, i] * A + B) * self._scales[i] + self._offsets[i]
             curve.setData(x=t, y=y)
-
-        if self._following and not self._static_mode:
-            t_max = float(t[-1])
-            w     = TIME_DIV_SEQ[self._time_div_idx] * N_DIV
-            self._set_x_range(t_max - w, t_max)
 
         # Обзор реже
         self._ov_tick += 1
