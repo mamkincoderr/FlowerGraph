@@ -77,7 +77,7 @@ def lod_indices(v: np.ndarray, max_pts: int) -> np.ndarray:
         return np.arange(n, dtype=np.intp)
 
     n_ch = v.shape[1] if v.ndim == 2 else 0
-    if n_ch == 0 or max_pts <= 2 * n_ch + 2:
+    if n_ch == 0 or max_pts < 2 * n_ch + 2:
         return np.linspace(0, n - 1, max_pts, dtype=np.intp)
 
     n_bins = max(1, (max_pts - 2) // (2 * n_ch))
