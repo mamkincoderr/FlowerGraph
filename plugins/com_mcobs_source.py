@@ -250,13 +250,21 @@ class ComMCobsSource(BaseSource):
         while True:
             delim = buf.find(0x00)
             if delim < 0:
-                if len(buf) > 1024:
+                if len(buf) > self._max_encoded_frame_size():
                     buf.clear()
                 break
             cobs_data = bytes(buf[:delim])
             del buf[:delim + 1]
             if cobs_data:
                 self._parse_packet(cobs_data)
+
+    def _max_encoded_frame_size(self) -> int:
+        """Maximum COBS frame size supported by the dialog's protocol limits."""
+        n_ch = max(1, int(self._config.n_channels or 256))
+        batch = max(1, min(64, int(self._config.batch_size or 1)))
+        raw_size = (n_ch * batch * _bps(self._config.data_format)
+                    + int(self._config.has_count) + 2 * int(self._config.use_crc))
+        return raw_size + raw_size // 254 + 1
 
     # ------------------------------------------------------------------
 

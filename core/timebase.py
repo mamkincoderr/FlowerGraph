@@ -67,38 +67,37 @@ def fmt_time_div(t: float) -> str:
     return f'{t / 3600:g} ч/дел'
 
 
-def lod_decimate(t: np.ndarray, v: np.ndarray, max_pts: int):
-    """Min/max LOD. Хвост окна не отбрасывается — иначе кривая обрывается косым срезом."""
-    n = len(t)
-    if n <= max_pts or n < 2:
-        return t, v
-    n_bins = max(1, max_pts // 2)
+
+def lod_indices(v: np.ndarray, max_pts: int) -> np.ndarray:
+    """Select chronological LOD indices while retaining each channel's extrema."""
+    n = len(v)
+    if n == 0 or max_pts <= 0:
+        return np.empty(0, dtype=np.intp)
+    if n <= max_pts:
+        return np.arange(n, dtype=np.intp)
+
+    n_ch = v.shape[1] if v.ndim == 2 else 0
+    if n_ch == 0 or max_pts <= 2 * n_ch + 2:
+        return np.linspace(0, n - 1, max_pts, dtype=np.intp)
+
+    n_bins = max(1, (max_pts - 2) // (2 * n_ch))
     step = int(np.ceil(n / n_bins))
-    if step < 2:
-        return t, v
     n_bins = int(np.ceil(n / step))
-    if n_bins * 2 > max_pts:
-        n_bins = max_pts // 2
-        step = int(np.ceil(n / n_bins))
     pad = n_bins * step - n
-    if pad > 0:
-        t = np.concatenate([t, np.repeat(t[-1:], pad)])
+    if pad:
         v = np.concatenate([v, np.repeat(v[-1:], pad, axis=0)])
-    v0 = np.ascontiguousarray(v[:n_bins * step, 0]).reshape(n_bins, step)
-    imin = v0.argmin(axis=1)
-    imax = v0.argmax(axis=1)
-    base = np.arange(n_bins, dtype=np.intp) * step
-    idx_min = base + imin
-    idx_max = base + imax
-    mask = imin <= imax
-    t_a = np.where(mask, t[idx_min], t[idx_max])
-    t_b = np.where(mask, t[idx_max], t[idx_min])
-    v_a = np.where(mask[:, None], v[idx_min], v[idx_max])
-    v_b = np.where(mask[:, None], v[idx_max], v[idx_min])
-    t_out = np.empty(2 * n_bins, dtype=np.float64)
-    t_out[0::2] = t_a
-    t_out[1::2] = t_b
-    v_out = np.empty((2 * n_bins, v.shape[1]), dtype=np.float32)
-    v_out[0::2] = v_a
-    v_out[1::2] = v_b
-    return t_out, v_out
+
+    bins = np.ascontiguousarray(v[:n_bins * step]).reshape(n_bins, step, n_ch)
+    base = np.arange(n_bins, dtype=np.intp)[:, None] * step
+    idx_min = base + bins.argmin(axis=1)
+    idx_max = base + bins.argmax(axis=1)
+    indices = np.concatenate((idx_min.ravel(), idx_max.ravel(), [0, n - 1]))
+    return np.unique(np.clip(indices, 0, n - 1))
+
+
+def lod_decimate(t: np.ndarray, v: np.ndarray, max_pts: int):
+    """Min/max LOD preserving every channel's extrema and both window endpoints."""
+    idx = lod_indices(v, max_pts)
+    if len(idx) == len(t) and (len(idx) == 0 or idx[-1] == len(t) - 1):
+        return t, v
+    return t[idx], v[idx]

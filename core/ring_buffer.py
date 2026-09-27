@@ -1,43 +1,13 @@
 import numpy as np
 from threading import Lock
 
+from core.timebase import lod_indices
+
 
 def _lod_view(t: np.ndarray, v: np.ndarray, max_pts: int):
-    """Min/max по уже непрерывному куску. Вид не копируется целиком."""
-    n = len(t)
-    if n <= max_pts or n < 2:
-        return t.copy(), v.copy()
-    n_bins = max(1, max_pts // 2)
-    step = int(np.ceil(n / n_bins))
-    if step < 2:
-        return t.copy(), v.copy()
-    n_bins = int(np.ceil(n / step))
-    if n_bins * 2 > max_pts:
-        n_bins = max_pts // 2
-        step = int(np.ceil(n / n_bins))
-    pad = n_bins * step - n
-    if pad > 0:
-        t = np.concatenate([t, np.repeat(t[-1:], pad)])
-        v = np.concatenate([v, np.repeat(v[-1:], pad, axis=0)])
-    col0 = np.ascontiguousarray(v[:n_bins * step, 0]).reshape(n_bins, step)
-    imin = col0.argmin(axis=1)
-    imax = col0.argmax(axis=1)
-    base = np.arange(n_bins, dtype=np.intp) * step
-    idx_min = base + imin
-    idx_max = base + imax
-    mask = imin <= imax
-    t_a = np.where(mask, t[idx_min], t[idx_max])
-    t_b = np.where(mask, t[idx_max], t[idx_min])
-    v_a = np.where(mask[:, None], v[idx_min], v[idx_max])
-    v_b = np.where(mask[:, None], v[idx_max], v[idx_min])
-    t_out = np.empty(2 * n_bins, dtype=np.float64)
-    t_out[0::2] = t_a
-    t_out[1::2] = t_b
-    v_out = np.empty((2 * n_bins, v.shape[1]), dtype=np.float32)
-    v_out[0::2] = v_a
-    v_out[1::2] = v_b
-    return t_out, v_out
-
+    """Min/max LOD view; copies only selected points."""
+    idx = lod_indices(v, max_pts)
+    return t[idx].copy(), v[idx].copy()
 
 class RingBuffer:
     """Кольцевой буфер для хранения временных рядов по N каналам."""
